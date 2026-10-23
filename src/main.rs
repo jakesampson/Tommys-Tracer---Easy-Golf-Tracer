@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 const EXPORT_FPS: u32 = 30;
 const FRAME_LIMIT: u32 = 60 * 60 * 30;
+const TRACER_REFERENCE_HEIGHT: f32 = 1080.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Keyframe {
@@ -31,11 +32,17 @@ struct Project {
     trim_in: f32,
     trim_out: f32,
     keyframes: Vec<Keyframe>,
+    #[serde(default = "default_path_smoothing")]
+    path_smoothing: f32,
     tracer: TracerStyle,
 }
 
 fn default_frame_rate() -> f32 {
     30.0
+}
+
+fn default_path_smoothing() -> f32 {
+    0.5
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,6 +92,7 @@ struct PreviewRequest {
     id: u64,
     path: PathBuf,
     time: f32,
+    frame_rate: f32,
 }
 
 enum PreviewCommand {
@@ -108,6 +116,7 @@ struct PreviewResult {
 struct PlaybackStream {
     child: Child,
     frames: Receiver<Vec<u8>>,
+    path: PathBuf,
     id: u64,
     time: f32,
     frame_rate: f32,
@@ -191,6 +200,7 @@ impl TracerApp {
                     trim_in: 0.0,
                     trim_out: duration,
                     keyframes: Vec::new(),
+                    path_smoothing: default_path_smoothing(),
                     tracer: TracerStyle::default(),
                 });
                 self.playhead_frame = 0;
@@ -215,6 +225,7 @@ impl TracerApp {
                 id: self.preview_request_id,
                 path: project.video_path.clone(),
                 time,
+                frame_rate: project.frame_rate,
             }))
         {
             self.status = format!("Could not request video preview: {error}");
@@ -251,7 +262,6 @@ impl TracerApp {
         if let Err(error) = self.preview_sender.send(PreviewCommand::Pause) {
             self.status = format!("Could not pause video preview: {error}");
         }
-        self.request_preview();
     }
 
     fn save_project(&mut self) {
@@ -474,8 +484,21 @@ impl TracerApp {
                     if ui.color_edit_button_srgba(&mut color).changed() {
                         project.tracer.color = [color.r(), color.g(), color.b()];
                     }
-                    ui.add(egui::Slider::new(&mut project.tracer.width, 1.0..=16.0).text("Width"));
-                    ui.add(egui::Slider::new(&mut project.tracer.glow, 0.0..=24.0).text("Glow"));
+                    ui.add(
+                        egui::Slider::new(&mut project.tracer.width, 1.0..=16.0)
+                            .text("Width (1080p px)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut project.tracer.glow, 0.0..=24.0)
+                            .text("Glow (1080p px)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut project.path_smoothing, 0.0..=1.0)
+                            .text("Smoothness"),
+                    )
+                    .on_hover_text(
+                        "Reduce frame-by-frame zigzags; higher values round sharp turns.",
+                    );
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.heading("Keyframes");
@@ -535,6 +558,9 @@ impl TracerApp {
             self.toggle_playback();
         } else if interaction.stop_playback && self.is_playing {
             self.pause_playback();
+            if interaction.refresh_preview {
+                self.request_preview();
+            }
         } else if interaction.refresh_preview {
             self.request_preview();
         }
@@ -553,13 +579,10 @@ impl eframe::App for TracerApp {
                 self.is_playing = false;
                 continue;
             }
-            if self.is_playing {
-                if let Some(project) = &self.project {
-                    if time >= project.trim_out {
-                        self.pause_playback();
-                    } else {
-                        self.playhead_frame = time_to_frame(time, project.frame_rate);
-                    }
+            if let Some(project) = &self.project {
+                self.playhead_frame = time_to_frame(time, project.frame_rate);
+                if self.is_playing && time >= project.trim_out {
+                    self.pause_playback();
                 }
             }
             match preview_result.result {
@@ -1005,7 +1028,8 @@ fn add_keyframe(project: &mut Project, time: f32, x: f32, y: f32) {
 }
 
 fn draw_preview_tracer(ui: &egui::Ui, rect: Rect, project: &Project, time: f32) {
-    let points = trail_points(&project.keyframes, time);
+    let (width, glow) = scaled_tracer_dimensions(&project.tracer, rect.height());
+    let points = trail_points(&project.keyframes, time, project.path_smoothing);
     let points: Vec<Pos2> = points
         .iter()
         .map(|(x, y)| {
@@ -1020,32 +1044,36 @@ fn draw_preview_tracer(ui: &egui::Ui, rect: Rect, project: &Project, time: f32) 
         project.tracer.color[1],
         project.tracer.color[2],
     );
-    for segment in points.windows(2) {
-        let start = segment[0];
-        let end = segment[1];
-        for layer in (1..=8).rev() {
-            let fraction = layer as f32 / 8.0;
-            let alpha = (8 + (8 - layer) * 8) as u8;
-            let glow_color = Color32::from_rgba_unmultiplied(
-                project.tracer.color[0],
-                project.tracer.color[1],
-                project.tracer.color[2],
-                alpha,
-            );
+    for layer in (1..=8).rev() {
+        let fraction = layer as f32 / 8.0;
+        let alpha = (8 + (8 - layer) * 8) as u8;
+        let glow_color = Color32::from_rgba_unmultiplied(
+            project.tracer.color[0],
+            project.tracer.color[1],
+            project.tracer.color[2],
+            alpha,
+        );
+        for segment in points.windows(2) {
             draw_preview_segment(
                 ui,
-                start,
-                end,
-                project.tracer.width + project.tracer.glow * 2.0 * fraction,
+                segment[0],
+                segment[1],
+                width + glow * 2.0 * fraction,
                 glow_color,
             );
         }
-        draw_preview_segment(ui, start, end, project.tracer.width, color);
+    }
+    for segment in points.windows(2) {
+        draw_preview_segment(ui, segment[0], segment[1], width, color);
     }
     if let Some(point) = points.last() {
-        ui.painter()
-            .circle_filled(*point, project.tracer.width, color);
+        ui.painter().circle_filled(*point, width, color);
     }
+}
+
+fn scaled_tracer_dimensions(style: &TracerStyle, canvas_height: f32) -> (f32, f32) {
+    let scale = canvas_height / TRACER_REFERENCE_HEIGHT;
+    (style.width * scale, style.glow * scale)
 }
 
 fn draw_preview_segment(ui: &egui::Ui, start: Pos2, end: Pos2, width: f32, color: Color32) {
@@ -1124,8 +1152,9 @@ fn preview_worker(
     repaint_context: egui::Context,
 ) {
     let mut playback: Option<PlaybackStream> = None;
+    let mut is_playing = false;
     loop {
-        let command = if playback.is_some() {
+        let command = if is_playing {
             match commands.recv_timeout(Duration::from_millis(2)) {
                 Ok(command) => Some(command),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -1141,113 +1170,148 @@ fn preview_worker(
             while let Ok(newer_command) = commands.try_recv() {
                 command = newer_command;
             }
-            stop_preview_process(&mut playback);
             match command {
                 PreviewCommand::Seek(request) => {
-                    let result = extract_frame(&request.path, request.time);
-                    let _ = results.send(PreviewResult {
-                        id: request.id,
-                        time: request.time,
-                        result,
-                        finished: false,
-                    });
-                    repaint_context.request_repaint();
+                    is_playing = false;
+                    stop_preview_process(&mut playback);
+                    match start_preview_stream(
+                        request.id,
+                        &request.path,
+                        request.time,
+                        request.frame_rate,
+                    ) {
+                        Ok((stream, first_frame)) => {
+                            let _ = results.send(PreviewResult {
+                                id: request.id,
+                                time: request.time,
+                                result: Ok(first_frame),
+                                finished: false,
+                            });
+                            playback = Some(stream);
+                            repaint_context.request_repaint();
+                        }
+                        Err(error) => {
+                            let _ = results.send(PreviewResult {
+                                id: request.id,
+                                time: request.time,
+                                result: Err(error),
+                                finished: false,
+                            });
+                            repaint_context.request_repaint();
+                        }
+                    }
                 }
                 PreviewCommand::Play {
                     id,
                     path,
                     time,
                     frame_rate,
-                } => match start_preview_stream(&path, time, frame_rate) {
-                    Ok((child, frames)) => {
-                        playback = Some(PlaybackStream {
-                            child,
-                            frames,
-                            id,
+                } => {
+                    let stream_is_ready = playback.as_ref().is_some_and(|stream| {
+                        preview_stream_is_ready(
+                            &stream.path,
+                            stream.time,
+                            stream.frame_rate,
+                            &path,
                             time,
                             frame_rate,
-                        });
+                        )
+                    });
+                    if stream_is_ready {
+                        if let Some(stream) = &mut playback {
+                            stream.id = id;
+                        }
+                        is_playing = true;
+                    } else {
+                        stop_preview_process(&mut playback);
+                        match start_preview_stream(id, &path, time, frame_rate) {
+                            Ok((stream, first_frame)) => {
+                                let _ = results.send(PreviewResult {
+                                    id,
+                                    time,
+                                    result: Ok(first_frame),
+                                    finished: false,
+                                });
+                                playback = Some(stream);
+                                is_playing = true;
+                                repaint_context.request_repaint();
+                            }
+                            Err(error) => {
+                                let _ = results.send(PreviewResult {
+                                    id,
+                                    time,
+                                    result: Err(error),
+                                    finished: false,
+                                });
+                                is_playing = false;
+                                repaint_context.request_repaint();
+                            }
+                        }
                     }
-                    Err(error) => {
-                        let _ = results.send(PreviewResult {
-                            id,
-                            time,
-                            result: Err(error),
-                            finished: false,
-                        });
-                        repaint_context.request_repaint();
-                    }
-                },
-                PreviewCommand::Pause => {}
+                }
+                PreviewCommand::Pause => {
+                    is_playing = false;
+                }
             }
             continue;
         }
 
-        if let Some(stream) = playback.as_mut() {
-            match stream.frames.try_recv() {
-                Ok(frame) => {
-                    let frame_time = stream.time;
-                    stream.time += 1.0 / stream.frame_rate;
-                    let _ = results.try_send(PreviewResult {
-                        id: stream.id,
-                        time: frame_time,
-                        result: Ok(frame),
-                        finished: false,
-                    });
-                    repaint_context.request_repaint();
-                    if stream.child.try_wait().ok().flatten().is_some() {
-                        let _ = results.send(PreviewResult {
+        if is_playing {
+            if let Some(stream) = playback.as_mut() {
+                match stream.frames.try_recv() {
+                    Ok(frame) => {
+                        let frame_time = stream.time;
+                        stream.time += 1.0 / stream.frame_rate;
+                        let _ = results.try_send(PreviewResult {
                             id: stream.id,
-                            time: stream.time,
-                            result: Ok(Vec::new()),
-                            finished: true,
+                            time: frame_time,
+                            result: Ok(frame),
+                            finished: false,
                         });
                         repaint_context.request_repaint();
-                        playback = None;
+                        if stream.child.try_wait().ok().flatten().is_some() {
+                            let _ = results.send(PreviewResult {
+                                id: stream.id,
+                                time: stream.time,
+                                result: Ok(Vec::new()),
+                                finished: true,
+                            });
+                            repaint_context.request_repaint();
+                            playback = None;
+                            is_playing = false;
+                        }
                     }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if stream.child.try_wait().ok().flatten().is_some() {
-                        let _ = results.send(PreviewResult {
-                            id: stream.id,
-                            time: stream.time,
-                            result: Ok(Vec::new()),
-                            finished: true,
-                        });
-                        repaint_context.request_repaint();
-                        playback = None;
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if stream.child.try_wait().ok().flatten().is_some() {
+                            let _ = results.send(PreviewResult {
+                                id: stream.id,
+                                time: stream.time,
+                                result: Ok(Vec::new()),
+                                finished: true,
+                            });
+                            repaint_context.request_repaint();
+                            playback = None;
+                            is_playing = false;
+                        }
                     }
+                    Err(mpsc::TryRecvError::Empty) => {}
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
+            } else {
+                is_playing = false;
             }
         }
     }
     stop_preview_process(&mut playback);
 }
 
-fn stop_preview_process(playback: &mut Option<PlaybackStream>) {
-    if let Some(mut stream) = playback.take() {
-        let _ = stream.child.kill();
-        let _ = stream.child.wait();
-    }
-}
-
 fn start_preview_stream(
+    id: u64,
     path: &Path,
     time: f32,
     frame_rate: f32,
-) -> Result<(Child, Receiver<Vec<u8>>), String> {
+) -> Result<(PlaybackStream, Vec<u8>), String> {
     let mut child = Command::new("ffmpeg")
-        .args([
-            "-v",
-            "error",
-            "-threads",
-            "1",
-            "-filter_threads",
-            "1",
-            "-re",
-            "-ss",
-        ])
+        .args(["-v", "error", "-ss"])
         .arg(format!("{time:.6}"))
         .arg("-i")
         .arg(path)
@@ -1272,17 +1336,28 @@ fn start_preview_stream(
         .stdout
         .take()
         .ok_or_else(|| "Could not read FFmpeg playback frames.".to_owned())?;
-    let (sender, receiver) = mpsc::sync_channel(2);
+    let (sender, frames) = mpsc::sync_channel(2);
     let reader_thread = std::thread::Builder::new()
         .name("opentracer-frame-reader".to_owned())
         .spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut buffered = Vec::new();
+            let frame_interval = Duration::from_secs_f64(1.0 / frame_rate as f64);
+            let mut next_frame_at: Option<Instant> = None;
             while let Ok(Some(frame)) = read_mjpeg_frame(&mut reader, &mut buffered) {
-                match sender.try_send(frame) {
-                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+                if let Some(deadline) = next_frame_at {
+                    let now = Instant::now();
+                    if deadline > now {
+                        std::thread::sleep(deadline - now);
+                    }
                 }
+                if sender.send(frame).is_err() {
+                    break;
+                }
+                next_frame_at = Some(next_frame_at.map_or_else(
+                    || Instant::now() + frame_interval,
+                    |deadline| deadline + frame_interval,
+                ));
             }
         });
     if let Err(error) = reader_thread {
@@ -1290,7 +1365,56 @@ fn start_preview_stream(
         let _ = child.wait();
         return Err(format!("Could not start video frame reader: {error}"));
     }
-    Ok((child, receiver))
+    let first_frame = match frames.recv() {
+        Ok(frame) => frame,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Could not read first FFmpeg preview frame: {error}"
+            ));
+        }
+    };
+    Ok((
+        PlaybackStream {
+            child,
+            frames,
+            path: path.to_path_buf(),
+            id,
+            time: time + 1.0 / frame_rate,
+            frame_rate,
+        },
+        first_frame,
+    ))
+}
+
+fn stop_preview_process(playback: &mut Option<PlaybackStream>) {
+    if let Some(mut stream) = playback.take() {
+        let _ = stream.child.kill();
+        let _ = stream.child.wait();
+    }
+}
+
+fn preview_stream_is_ready(
+    stream_path: &Path,
+    next_frame_time: f32,
+    stream_frame_rate: f32,
+    requested_path: &Path,
+    requested_time: f32,
+    frame_rate: f32,
+) -> bool {
+    if !frame_rate.is_finite()
+        || frame_rate <= 0.0
+        || stream_path != requested_path
+        || (stream_frame_rate - frame_rate).abs() > 0.001
+    {
+        return false;
+    }
+    let first_expected_time = requested_time + 1.0 / frame_rate;
+    let half_frame = 0.5 / frame_rate;
+    let buffered_frames = 4.0;
+    next_frame_time >= first_expected_time - half_frame
+        && next_frame_time <= first_expected_time + buffered_frames / frame_rate
 }
 
 fn read_mjpeg_frame(
@@ -1329,38 +1453,6 @@ fn read_mjpeg_frame(
         }
         buffered.extend_from_slice(&chunk[..read]);
     }
-}
-
-fn extract_frame(path: &Path, time: f32) -> Result<Vec<u8>, String> {
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-threads", "1", "-ss"])
-        .arg(format!("{time:.3}"))
-        .arg("-i")
-        .arg(path)
-        .args([
-            "-frames:v",
-            "1",
-            "-vf",
-            "scale=960:960:force_original_aspect_ratio=decrease",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "pipe:1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| {
-            format!("Could not start ffmpeg. Install FFmpeg and add it to PATH: {error}")
-        })?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Err(format!(
-            "Could not extract preview frame: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(output.stdout)
 }
 
 fn export_project(
@@ -1438,33 +1530,23 @@ fn render_overlay_frames(
     }
     let keys = &project.keyframes;
     let rgb = project.tracer.color;
+    let (line_width, glow) = scaled_tracer_dimensions(&project.tracer, height as f32);
     let mut last_report = Instant::now();
     for frame_index in 0..frames {
         let time = project.trim_in + frame_index as f32 / EXPORT_FPS as f32;
-        let points = trail_points(keys, time);
+        let points = trail_points(keys, time, project.path_smoothing);
         let mut image = RgbaImage::new(width, height);
         let line_color = Rgba([rgb[0], rgb[1], rgb[2], 255]);
         let scaled: Vec<(f32, f32)> = points
             .iter()
             .map(|(x, y)| (x * width as f32, y * height as f32))
             .collect();
-        for segment in scaled.windows(2) {
-            let start = (segment[0].0, segment[0].1);
-            let end = (segment[1].0, segment[1].1);
-            draw_feathered_line(
-                &mut image,
-                start,
-                end,
-                project.tracer.width,
-                project.tracer.glow,
-                rgb,
-            );
-        }
+        draw_feathered_path(&mut image, &scaled, line_width, glow, rgb);
         if let Some((x, y)) = scaled.last().copied() {
             draw_filled_circle_mut(
                 &mut image,
                 (x.round() as i32, y.round() as i32),
-                project.tracer.width.ceil() as i32,
+                line_width.ceil() as i32,
                 line_color,
             );
         }
@@ -1503,10 +1585,9 @@ fn draw_thick_line(
     }
 }
 
-fn draw_feathered_line(
+fn draw_feathered_path(
     image: &mut RgbaImage,
-    start: (f32, f32),
-    end: (f32, f32),
+    points: &[(f32, f32)],
     core_width: f32,
     glow: f32,
     rgb: [u8; 3],
@@ -1517,19 +1598,23 @@ fn draw_feathered_line(
             let alpha = (8 + (8 - layer) * 8) as u8;
             let color = Rgba([rgb[0], rgb[1], rgb[2], alpha]);
             let width = (core_width + glow * 2.0 * fraction).ceil() as u32;
-            draw_thick_line(image, start, end, width, color);
+            for segment in points.windows(2) {
+                draw_thick_line(image, segment[0], segment[1], width, color);
+            }
         }
     }
-    draw_thick_line(
-        image,
-        start,
-        end,
-        core_width.ceil() as u32,
-        Rgba([rgb[0], rgb[1], rgb[2], 255]),
-    );
+    for segment in points.windows(2) {
+        draw_thick_line(
+            image,
+            segment[0],
+            segment[1],
+            core_width.ceil() as u32,
+            Rgba([rgb[0], rgb[1], rgb[2], 255]),
+        );
+    }
 }
 
-fn trail_points(keys: &[Keyframe], time: f32) -> Vec<(f32, f32)> {
+fn trail_points(keys: &[Keyframe], time: f32, smoothing: f32) -> Vec<(f32, f32)> {
     const CURVE_SAMPLES: usize = 16;
     let Some(first) = keys.first() else {
         return Vec::new();
@@ -1537,6 +1622,9 @@ fn trail_points(keys: &[Keyframe], time: f32) -> Vec<(f32, f32)> {
     if time < first.time {
         return Vec::new();
     }
+    let smoothed_keys = smooth_keyframes(keys, smoothing);
+    let keys = smoothed_keys.as_slice();
+    let first = &keys[0];
     let mut points = vec![(first.x, first.y)];
     for segment_index in 0..keys.len().saturating_sub(1) {
         let start = &keys[segment_index];
@@ -1561,6 +1649,22 @@ fn trail_points(keys: &[Keyframe], time: f32) -> Vec<(f32, f32)> {
         }
     }
     points
+}
+
+fn smooth_keyframes(keys: &[Keyframe], amount: f32) -> Vec<Keyframe> {
+    let mut smoothed = keys.to_vec();
+    let strength = amount.clamp(0.0, 1.0);
+    let blend = strength * 0.25;
+    for _ in 0..4 {
+        let previous = smoothed.clone();
+        for index in 1..smoothed.len().saturating_sub(1) {
+            let average_x = (previous[index - 1].x + previous[index + 1].x) * 0.5;
+            let average_y = (previous[index - 1].y + previous[index + 1].y) * 0.5;
+            smoothed[index].x = previous[index].x * (1.0 - blend) + average_x * blend;
+            smoothed[index].y = previous[index].y * (1.0 - blend) + average_y * blend;
+        }
+    }
+    smoothed
 }
 
 fn catmull_rom_point(
@@ -1679,11 +1783,25 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        draw_feathered_line, frame_time, read_mjpeg_frame, snap_trim_time, time_to_frame,
-        trail_points, Keyframe,
+        draw_feathered_path, frame_time, preview_stream_is_ready, read_mjpeg_frame,
+        scaled_tracer_dimensions, smooth_keyframes, snap_trim_time, time_to_frame, trail_points,
+        Keyframe, TracerStyle,
     };
     use image::{Rgba, RgbaImage};
     use std::io::Cursor;
+
+    #[test]
+    fn tracer_dimensions_scale_consistently_between_preview_and_export() {
+        let style = TracerStyle {
+            width: 8.0,
+            glow: 12.0,
+            ..TracerStyle::default()
+        };
+        let (preview_width, preview_glow) = scaled_tracer_dimensions(&style, 540.0);
+        let (export_width, export_glow) = scaled_tracer_dimensions(&style, 2160.0);
+        assert_eq!((preview_width, preview_glow), (4.0, 6.0));
+        assert_eq!((export_width, export_glow), (16.0, 24.0));
+    }
 
     #[test]
     fn tracer_is_hidden_before_first_keyframe() {
@@ -1692,7 +1810,7 @@ mod tests {
             x: 0.2,
             y: 0.4,
         }];
-        assert!(trail_points(&keys, 0.5).is_empty());
+        assert!(trail_points(&keys, 0.5, 0.0).is_empty());
     }
 
     #[test]
@@ -1709,7 +1827,7 @@ mod tests {
                 y: 0.6,
             },
         ];
-        let points = trail_points(&keys, 1.0);
+        let points = trail_points(&keys, 1.0, 0.0);
         let (x, y) = points.last().copied().expect("interpolated point");
         assert!((x - 0.5).abs() < 0.0001);
         assert!((y - 0.5).abs() < 0.0001);
@@ -1739,7 +1857,7 @@ mod tests {
                 y: 0.0,
             },
         ];
-        let points = trail_points(&keys, 1.5);
+        let points = trail_points(&keys, 1.5, 0.0);
         assert!(points.iter().any(|(_, y)| *y > 0.5));
         let (x, y) = points.last().copied().expect("interpolated point");
         assert!((x - 0.5).abs() < 0.0001);
@@ -1747,10 +1865,88 @@ mod tests {
     }
 
     #[test]
+    fn path_smoothing_reduces_keyframe_zigzags_and_preserves_endpoints() {
+        let keys = [
+            Keyframe {
+                time: 0.0,
+                x: 0.1,
+                y: 0.5,
+            },
+            Keyframe {
+                time: 1.0,
+                x: 0.3,
+                y: 0.3,
+            },
+            Keyframe {
+                time: 2.0,
+                x: 0.5,
+                y: 0.7,
+            },
+            Keyframe {
+                time: 3.0,
+                x: 0.7,
+                y: 0.3,
+            },
+            Keyframe {
+                time: 4.0,
+                x: 0.9,
+                y: 0.5,
+            },
+        ];
+        let smoothed = smooth_keyframes(&keys, 1.0);
+        assert_eq!(smoothed.first().unwrap().x, keys[0].x);
+        assert_eq!(smoothed.first().unwrap().y, keys[0].y);
+        assert_eq!(smoothed.last().unwrap().x, keys[4].x);
+        assert_eq!(smoothed.last().unwrap().y, keys[4].y);
+        assert!(smoothed[2].y < keys[2].y);
+        assert!(smoothed[2].y > 0.3);
+    }
+
+    #[test]
     fn frame_navigation_uses_source_frame_rate() {
         let time = frame_time(42, 120.0);
         assert!((time - 0.35).abs() < f32::EPSILON);
         assert_eq!(time_to_frame(time, 120.0), 42);
+    }
+
+    #[test]
+    fn paused_preview_stream_is_reused_only_for_nearby_frames() {
+        let path = std::path::Path::new("/video.mov");
+        let frame_rate = 30.0;
+        let requested_time = 2.0;
+        let next_frame_time = requested_time + 1.0 / frame_rate;
+        assert!(preview_stream_is_ready(
+            path,
+            next_frame_time,
+            frame_rate,
+            path,
+            requested_time,
+            frame_rate,
+        ));
+        assert!(preview_stream_is_ready(
+            path,
+            next_frame_time + 3.0 / frame_rate,
+            frame_rate,
+            path,
+            requested_time,
+            frame_rate,
+        ));
+        assert!(!preview_stream_is_ready(
+            path,
+            next_frame_time + 5.0 / frame_rate,
+            frame_rate,
+            path,
+            requested_time,
+            frame_rate,
+        ));
+        assert!(!preview_stream_is_ready(
+            path,
+            next_frame_time,
+            frame_rate,
+            std::path::Path::new("/other.mov"),
+            requested_time,
+            frame_rate,
+        ));
     }
 
     #[test]
@@ -1762,10 +1958,9 @@ mod tests {
     #[test]
     fn tracer_stroke_is_continuous_with_a_feathered_edge() {
         let mut image = RgbaImage::new(100, 40);
-        draw_feathered_line(
+        draw_feathered_path(
             &mut image,
-            (5.0, 20.0),
-            (95.0, 20.0),
+            &[(5.0, 20.0), (95.0, 20.0)],
             4.0,
             6.0,
             [40, 220, 80],
@@ -1775,6 +1970,19 @@ mod tests {
         for x in 10..90 {
             assert_eq!(image.get_pixel(x, 20), &Rgba([40, 220, 80, 255]));
         }
+    }
+
+    #[test]
+    fn later_curve_glow_does_not_cover_earlier_solid_tracer_core() {
+        let mut image = RgbaImage::new(100, 40);
+        draw_feathered_path(
+            &mut image,
+            &[(5.0, 20.0), (50.0, 20.0), (5.0, 22.0)],
+            4.0,
+            8.0,
+            [40, 220, 80],
+        );
+        assert_eq!(image.get_pixel(30, 20), &Rgba([40, 220, 80, 255]));
     }
 
     #[test]
