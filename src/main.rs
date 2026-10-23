@@ -376,7 +376,7 @@ impl TracerApp {
                 ui.add_space(ui.available_height() * 0.2);
                 ui.heading("OpenTracer");
                 ui.add_space(8.0);
-                ui.label("Trim your golf video, then trace the ball flight frame by frame.");
+                ui.label("Open a golf video and trace the ball flight frame by frame.");
                 ui.add_space(24.0);
                 if ui.button("Select a video").clicked() {
                     self.open_video();
@@ -406,15 +406,6 @@ impl TracerApp {
                     if ui.button("Continue to tracing").clicked() {
                         self.screen = AppScreen::Trace;
                     }
-                    if ui.button("Skip trimming").clicked() {
-                        if let Some(project) = &mut self.project {
-                            project.trim_in = 0.0;
-                            project.trim_out = project.duration;
-                            self.playhead_frame = 0;
-                            self.request_preview();
-                        }
-                        self.screen = AppScreen::Trace;
-                    }
                 });
             });
         });
@@ -434,7 +425,7 @@ impl TracerApp {
                     &mut self.is_playing,
                     &mut self.timeline_drag,
                     (&self.preview, self.preview_size),
-                    false,
+                    true,
                 );
             });
         });
@@ -533,7 +524,7 @@ impl TracerApp {
                 &mut self.is_playing,
                 &mut self.timeline_drag,
                 (&self.preview, self.preview_size),
-                true,
+                false,
             );
         });
         self.apply_editor_interaction(interaction);
@@ -578,11 +569,15 @@ impl eframe::App for TracerApp {
                         let size = [image.width() as usize, image.height() as usize];
                         let color_image =
                             egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-                        self.preview = Some(ctx.load_texture(
-                            "video-preview",
-                            color_image,
-                            Default::default(),
-                        ));
+                        if let Some(preview) = &mut self.preview {
+                            preview.set(color_image, Default::default());
+                        } else {
+                            self.preview = Some(ctx.load_texture(
+                                "video-preview",
+                                color_image,
+                                Default::default(),
+                            ));
+                        }
                         self.preview_size = size;
                         self.status =
                             format!("Preview: frame {} ({time:.3}s)", self.playhead_frame);
@@ -672,7 +667,7 @@ fn draw_video_editor(
     is_playing: &mut bool,
     timeline_drag: &mut Option<TimelineDrag>,
     preview_data: (&Option<egui::TextureHandle>, [usize; 2]),
-    allow_keyframes: bool,
+    trim_mode: bool,
 ) -> EditorInteraction {
     let mut interaction = EditorInteraction::default();
     ui.horizontal(|ui| {
@@ -718,7 +713,7 @@ fn draw_video_editor(
             frame_time(*playhead_frame, project.frame_rate),
             project.frame_rate
         ));
-        if allow_keyframes && ui.button("Add keyframe").clicked() {
+        if !trim_mode && ui.button("Add keyframe").clicked() {
             let time = frame_time(*playhead_frame, project.frame_rate);
             add_keyframe(project, time, 0.5, 0.5);
         }
@@ -743,7 +738,7 @@ fn draw_video_editor(
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
             Color32::WHITE,
         );
-        if allow_keyframes {
+        if !trim_mode {
             draw_preview_tracer(
                 ui,
                 rect,
@@ -771,7 +766,7 @@ fn draw_video_editor(
         );
     }
     ui.add_space(4.0);
-    let timeline_interaction = draw_timeline(ui, project, playhead_frame, timeline_drag);
+    let timeline_interaction = draw_timeline(ui, project, playhead_frame, timeline_drag, trim_mode);
     interaction.refresh_preview |= timeline_interaction.refresh_preview;
     if timeline_drag.is_some() {
         interaction.stop_playback |= *is_playing;
@@ -814,6 +809,7 @@ fn draw_timeline(
     project: &mut Project,
     playhead_frame: &mut u64,
     drag_mode: &mut Option<TimelineDrag>,
+    allow_trimming: bool,
 ) -> TimelineInteraction {
     let available_width = ui.available_width();
     let (rect, response) =
@@ -836,7 +832,11 @@ fn draw_timeline(
     painter.text(
         Pos2::new(track.left(), rect.top() + 4.0),
         egui::Align2::LEFT_TOP,
-        "TIMELINE  |  Drag handles to trim; shaded area is kept",
+        if allow_trimming {
+            "TIMELINE  |  Drag handles to trim; shaded area is kept"
+        } else {
+            "TIMELINE  |  Drag to move the playhead"
+        },
         egui::FontId::proportional(11.0),
         Color32::GRAY,
     );
@@ -894,37 +894,39 @@ fn draw_timeline(
         );
     }
 
-    for (x, color) in [
-        (trim_start_x, Color32::from_rgb(95, 211, 147)),
-        (trim_end_x, Color32::from_rgb(95, 211, 147)),
-    ] {
-        painter.line_segment(
-            [
-                Pos2::new(x, track.top() - 6.0),
-                Pos2::new(x, track.bottom() + 1.0),
-            ],
-            Stroke::new(2.0_f32, color),
+    if allow_trimming {
+        for (x, color) in [
+            (trim_start_x, Color32::from_rgb(95, 211, 147)),
+            (trim_end_x, Color32::from_rgb(95, 211, 147)),
+        ] {
+            painter.line_segment(
+                [
+                    Pos2::new(x, track.top() - 6.0),
+                    Pos2::new(x, track.bottom() + 1.0),
+                ],
+                Stroke::new(2.0_f32, color),
+            );
+            painter.rect_filled(
+                Rect::from_center_size(Pos2::new(x, track.center().y), Vec2::new(7.0, 24.0)),
+                2.0,
+                color,
+            );
+        }
+        painter.text(
+            Pos2::new(trim_start_x, track.top() - 8.0),
+            egui::Align2::CENTER_BOTTOM,
+            "IN",
+            egui::FontId::monospace(9.0),
+            Color32::from_rgb(95, 211, 147),
         );
-        painter.rect_filled(
-            Rect::from_center_size(Pos2::new(x, track.center().y), Vec2::new(7.0, 24.0)),
-            2.0,
-            color,
+        painter.text(
+            Pos2::new(trim_end_x, track.top() - 8.0),
+            egui::Align2::CENTER_BOTTOM,
+            "OUT",
+            egui::FontId::monospace(9.0),
+            Color32::from_rgb(95, 211, 147),
         );
     }
-    painter.text(
-        Pos2::new(trim_start_x, track.top() - 8.0),
-        egui::Align2::CENTER_BOTTOM,
-        "IN",
-        egui::FontId::monospace(9.0),
-        Color32::from_rgb(95, 211, 147),
-    );
-    painter.text(
-        Pos2::new(trim_end_x, track.top() - 8.0),
-        egui::Align2::CENTER_BOTTOM,
-        "OUT",
-        egui::FontId::monospace(9.0),
-        Color32::from_rgb(95, 211, 147),
-    );
     painter.line_segment(
         [
             Pos2::new(playhead_x, rect.top() + 20.0),
@@ -940,13 +942,15 @@ fn draw_timeline(
 
     if response.drag_started() {
         if let Some(pointer) = response.interact_pointer_pos() {
-            *drag_mode = Some(if (pointer.x - trim_start_x).abs() <= 10.0 {
-                TimelineDrag::TrimIn
-            } else if (pointer.x - trim_end_x).abs() <= 10.0 {
-                TimelineDrag::TrimOut
-            } else {
-                TimelineDrag::Playhead
-            });
+            *drag_mode = Some(
+                if allow_trimming && (pointer.x - trim_start_x).abs() <= 10.0 {
+                    TimelineDrag::TrimIn
+                } else if allow_trimming && (pointer.x - trim_end_x).abs() <= 10.0 {
+                    TimelineDrag::TrimOut
+                } else {
+                    TimelineDrag::Playhead
+                },
+            );
         }
     }
 
@@ -1234,7 +1238,16 @@ fn start_preview_stream(
     frame_rate: f32,
 ) -> Result<(Child, Receiver<Vec<u8>>), String> {
     let mut child = Command::new("ffmpeg")
-        .args(["-v", "error", "-re", "-ss"])
+        .args([
+            "-v",
+            "error",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-re",
+            "-ss",
+        ])
         .arg(format!("{time:.6}"))
         .arg("-i")
         .arg(path)
@@ -1266,8 +1279,9 @@ fn start_preview_stream(
             let mut reader = BufReader::new(stdout);
             let mut buffered = Vec::new();
             while let Ok(Some(frame)) = read_mjpeg_frame(&mut reader, &mut buffered) {
-                if sender.send(frame).is_err() {
-                    break;
+                match sender.try_send(frame) {
+                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
                 }
             }
         });
