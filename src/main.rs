@@ -3,7 +3,11 @@ use std::{
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,6 +24,11 @@ const TRACER_REFERENCE_HEIGHT: f32 = 1080.0;
 const TRACER_WIDTH_MAX: f32 = 16.0;
 const TRACER_GLOW_MAX: f32 = 24.0;
 const STYLE_SCALE_MAX: i32 = 10;
+const MOTION_ANALYSIS_FPS: u32 = 10;
+
+fn expected_motion_analysis_samples(duration: f32) -> usize {
+    (duration * MOTION_ANALYSIS_FPS as f32).ceil().max(1.0) as usize
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Keyframe {
@@ -37,9 +46,20 @@ struct Project {
     trim_in: f32,
     trim_out: f32,
     keyframes: Vec<Keyframe>,
+    #[serde(default)]
+    camera_motion: Vec<CameraMotionSample>,
+    #[serde(default)]
+    camera_motion_enabled: bool,
     #[serde(default = "default_path_smoothing")]
     path_smoothing: f32,
     tracer: TracerStyle,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CameraMotionSample {
+    time: f32,
+    x: f32,
+    y: f32,
 }
 
 fn default_frame_rate() -> f32 {
@@ -91,6 +111,12 @@ struct TracerApp {
     preview: Option<egui::TextureHandle>,
     tracer_glow: Option<egui::TextureHandle>,
     preview_size: [usize; 2],
+    motion_receiver: Option<Receiver<MotionAnalysisMessage>>,
+    motion_cancel: Option<Arc<AtomicBool>>,
+    motion_analysis_selection: Option<(PathBuf, f32, f32)>,
+    motion_analysis_frames: usize,
+    motion_analysis_total: usize,
+    motion_analysis_progress: f32,
     export_receiver: Option<Receiver<ExportMessage>>,
     export_progress: f32,
     export_phase: String,
@@ -101,6 +127,7 @@ struct TracerApp {
 enum AppScreen {
     Welcome,
     Trim,
+    Stabilize,
     Trace,
 }
 
@@ -149,6 +176,11 @@ enum ExportMessage {
     Finished(Result<PathBuf, String>),
 }
 
+enum MotionAnalysisMessage {
+    Progress { completed: usize, total: usize },
+    Finished(Result<Vec<CameraMotionSample>, String>),
+}
+
 #[derive(Clone, Copy)]
 enum TimelineDrag {
     Playhead,
@@ -195,6 +227,12 @@ impl TracerApp {
             preview: None,
             tracer_glow: None,
             preview_size: [0, 0],
+            motion_receiver: None,
+            motion_cancel: None,
+            motion_analysis_selection: None,
+            motion_analysis_frames: 0,
+            motion_analysis_total: 0,
+            motion_analysis_progress: 0.0,
             export_receiver: None,
             export_progress: 0.0,
             export_phase: String::new(),
@@ -224,6 +262,8 @@ impl TracerApp {
                     trim_in: 0.0,
                     trim_out: duration,
                     keyframes: Vec::new(),
+                    camera_motion: Vec::new(),
+                    camera_motion_enabled: false,
                     path_smoothing: default_path_smoothing(),
                     tracer: TracerStyle::default(),
                 });
@@ -309,6 +349,61 @@ impl TracerApp {
         }
     }
 
+    fn analyze_camera_motion(&mut self, ctx: &egui::Context) {
+        let Some(project) = self.project.clone() else {
+            self.status = "Open a video before analyzing camera motion.".to_owned();
+            return;
+        };
+        if self.motion_receiver.is_some() {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let expected_frames = expected_motion_analysis_samples(project.trim_out - project.trim_in);
+        self.motion_analysis_selection = Some((
+            project.video_path.clone(),
+            project.trim_in,
+            project.trim_out,
+        ));
+        let repaint_context = ctx.clone();
+        match std::thread::Builder::new()
+            .name("opentracer-motion-analysis".to_owned())
+            .spawn(move || {
+                let progress_sender = sender.clone();
+                let result =
+                    analyze_camera_motion(&project, &worker_cancelled, |completed, total| {
+                        let _ = progress_sender
+                            .send(MotionAnalysisMessage::Progress { completed, total });
+                        repaint_context.request_repaint();
+                    });
+                let _ = sender.send(MotionAnalysisMessage::Finished(result));
+                repaint_context.request_repaint();
+            }) {
+            Ok(_) => {
+                self.motion_receiver = Some(receiver);
+                self.motion_cancel = Some(cancelled);
+                self.motion_analysis_frames = 0;
+                self.motion_analysis_total = expected_frames;
+                self.motion_analysis_progress = 0.0;
+                self.status = "Analyzing camera movement...".to_owned();
+            }
+            Err(error) => {
+                self.motion_analysis_selection = None;
+                self.status = format!("Could not start camera-motion analysis: {error}");
+            }
+        }
+    }
+
+    fn cancel_motion_analysis(&mut self) {
+        if let Some(cancelled) = self.motion_cancel.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        self.motion_receiver = None;
+        self.motion_analysis_selection = None;
+    }
+
     fn load_project(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("OpenTracer project", &["otracer", "json"])
@@ -335,6 +430,13 @@ impl TracerApp {
                 project.trim_in = project.trim_in.clamp(0.0, project.duration);
                 project.trim_out = project.trim_out.clamp(project.trim_in, project.duration);
                 project.keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
+                project.camera_motion.retain(|sample| {
+                    sample.time.is_finite() && sample.x.is_finite() && sample.y.is_finite()
+                });
+                project
+                    .camera_motion
+                    .sort_by(|a, b| a.time.total_cmp(&b.time));
+                project.camera_motion_enabled &= !project.camera_motion.is_empty();
                 self.playhead_frame = time_to_frame(project.trim_in, project.frame_rate);
                 self.project = Some(project);
                 self.is_playing = false;
@@ -492,8 +594,11 @@ impl TracerApp {
                         self.open_video();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Continue to tracing").clicked() {
-                            self.screen = AppScreen::Trace;
+                        if ui.button("Continue to stabilization").clicked() {
+                            if self.is_playing {
+                                self.pause_playback();
+                            }
+                            self.screen = AppScreen::Stabilize;
                         }
                     });
                 });
@@ -503,6 +608,7 @@ impl TracerApp {
             self.screen = AppScreen::Welcome;
             return;
         };
+        let original_trim = (project.trim_in, project.trim_out);
         if self.screen == AppScreen::Trace {
             self.playhead_frame = time_to_frame(project.trim_in, project.frame_rate);
         }
@@ -521,10 +627,115 @@ impl TracerApp {
                 );
             });
         });
+        if original_trim != (project.trim_in, project.trim_out) {
+            project.camera_motion.clear();
+            project.camera_motion_enabled = false;
+        }
         if self.screen == AppScreen::Trace {
             self.request_preview();
         }
         self.apply_editor_interaction(interaction);
+    }
+
+    fn show_stabilization_screen(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("stabilization_toolbar")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(21, 32, 45, 245))
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Back to trim").clicked() {
+                        self.cancel_motion_analysis();
+                        self.screen = AppScreen::Trim;
+                    }
+                    ui.separator();
+                    ui.label("2. Stabilize camera motion (experimental)");
+                });
+            });
+
+        let Some(project) = &mut self.project else {
+            self.screen = AppScreen::Welcome;
+            return;
+        };
+        let mut start_analysis = false;
+        let mut cancel_analysis = false;
+        let mut continue_to_trace = None;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(30.0);
+                ui.heading("Keep the tracer anchored to the scene");
+                ui.add_space(10.0);
+                ui.label(
+                    "Analyze the trimmed clip for small camera translations. \
+                     Motion compensation moves the tracer with the scene; \
+                     it does not crop or alter the source video.",
+                );
+                ui.add_space(20.0);
+                if self.motion_receiver.is_some() {
+                    ui.add(
+                        egui::ProgressBar::new(self.motion_analysis_progress)
+                            .desired_width(420.0)
+                            .text(format!(
+                                "Analyzed {} / {} frames ({:.0}%)",
+                                self.motion_analysis_frames,
+                                self.motion_analysis_total,
+                                self.motion_analysis_progress * 100.0
+                            )),
+                    );
+                    if ui.button("Cancel analysis").clicked() {
+                        cancel_analysis = true;
+                    }
+                } else if ui.button("Analyze camera motion").clicked() {
+                    start_analysis = true;
+                }
+                if !project.camera_motion.is_empty() {
+                    ui.add_space(14.0);
+                    ui.checkbox(
+                        &mut project.camera_motion_enabled,
+                        "Apply motion compensation",
+                    );
+                    ui.label(format!(
+                        "Analyzed {} motion samples. Turn compensation off at any time to compare.",
+                        project.camera_motion.len()
+                    ));
+                } else {
+                    ui.add_space(14.0);
+                    ui.label("You can skip this experiment and use the original footage.");
+                }
+                ui.add_space(24.0);
+                if ui.button("Continue to tracing").clicked() {
+                    continue_to_trace = Some(false);
+                }
+                if ui.button("Skip stabilization and continue").clicked() {
+                    continue_to_trace = Some(true);
+                }
+            });
+        });
+        if start_analysis {
+            self.analyze_camera_motion(ctx);
+        }
+        if cancel_analysis {
+            self.cancel_motion_analysis();
+            self.status = "Camera-motion analysis cancelled.".to_owned();
+        }
+        if let Some(skip_stabilization) = continue_to_trace {
+            self.cancel_motion_analysis();
+            if skip_stabilization {
+                if let Some(project) = &mut self.project {
+                    project.camera_motion_enabled = false;
+                }
+            }
+            if self.is_playing {
+                self.pause_playback();
+            }
+            self.screen = AppScreen::Trace;
+            if let Some(project) = &self.project {
+                self.playhead_frame = time_to_frame(project.trim_in, project.frame_rate);
+            }
+            self.request_preview();
+        }
     }
 
     fn show_trace_screen(&mut self, ctx: &egui::Context) {
@@ -543,7 +754,7 @@ impl TracerApp {
                         self.screen = AppScreen::Trim;
                     }
                     ui.separator();
-                    ui.label("2. Trace ball flight");
+                    ui.label("3. Trace ball flight");
                     if ui.button("Open project").clicked() {
                         self.load_project();
                     }
@@ -558,6 +769,11 @@ impl TracerApp {
                         .clicked()
                     {
                         self.export_video(ctx);
+                    }
+                    if let Some(project) = &mut self.project {
+                        if !project.camera_motion.is_empty() {
+                            ui.checkbox(&mut project.camera_motion_enabled, "Motion compensation");
+                        }
                     }
                 });
             });
@@ -713,6 +929,7 @@ impl eframe::App for TracerApp {
                     self.pause_playback();
                 }
             }
+
             match preview_result.result {
                 Ok(frame) => {
                     let color_image =
@@ -730,6 +947,63 @@ impl eframe::App for TracerApp {
                     self.status = format!("Preview: frame {} ({time:.3}s)", self.playhead_frame);
                 }
                 Err(error) => self.status = error,
+            }
+        }
+
+        let mut finished_motion = None;
+        if let Some(receiver) = &self.motion_receiver {
+            loop {
+                match receiver.try_recv() {
+                    Ok(MotionAnalysisMessage::Progress { completed, total }) => {
+                        self.motion_analysis_frames = completed;
+                        self.motion_analysis_total = total;
+                        self.motion_analysis_progress =
+                            (completed as f32 / total.max(1) as f32).clamp(0.0, 1.0);
+                    }
+                    Ok(MotionAnalysisMessage::Finished(result)) => {
+                        finished_motion = Some(result);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        finished_motion = Some(Err(
+                            "Camera-motion analysis stopped unexpectedly.".to_owned()
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(result) = finished_motion {
+            self.motion_receiver = None;
+            self.motion_cancel = None;
+            let analyzed_selection = self.motion_analysis_selection.take();
+            match result {
+                Ok(samples) if samples.len() > 1 => {
+                    let selection_matches = self.project.as_ref().is_some_and(|project| {
+                        analyzed_selection
+                            .as_ref()
+                            .is_some_and(|(path, trim_in, trim_out)| {
+                                path == &project.video_path
+                                    && (trim_in - project.trim_in).abs() < f32::EPSILON
+                                    && (trim_out - project.trim_out).abs() < f32::EPSILON
+                            })
+                    });
+                    if selection_matches {
+                        if let Some(project) = &mut self.project {
+                            project.camera_motion = samples;
+                            project.camera_motion_enabled = true;
+                        }
+                        self.motion_analysis_progress = 1.0;
+                        self.status = "Camera-motion analysis complete.".to_owned();
+                    } else {
+                        self.status =
+                            "Motion analysis finished, but the video trim changed; results were discarded."
+                                .to_owned();
+                    }
+                }
+                Ok(_) => self.status = "The trimmed clip is too short to analyze.".to_owned(),
+                Err(error) => self.status = format!("Camera-motion analysis failed: {error}"),
             }
         }
 
@@ -798,6 +1072,7 @@ impl eframe::App for TracerApp {
         match self.screen {
             AppScreen::Welcome => self.show_welcome(ctx),
             AppScreen::Trim => self.show_trim_screen(ctx),
+            AppScreen::Stabilize => self.show_stabilization_screen(ctx),
             AppScreen::Trace => self.show_trace_screen(ctx),
         }
     }
@@ -863,11 +1138,13 @@ fn draw_video_editor(
             );
             if response.clicked() {
                 if let Some(position) = response.interact_pointer_pos() {
+                    let time = frame_time(*playhead_frame, project.frame_rate);
+                    let (offset_x, offset_y) = camera_motion_offset(project, time);
                     add_keyframe(
                         project,
-                        frame_time(*playhead_frame, project.frame_rate),
-                        ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
-                        ((position.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
+                        time,
+                        (((position.x - rect.left()) / rect.width()) - offset_x).clamp(0.0, 1.0),
+                        (((position.y - rect.top()) / rect.height()) - offset_y).clamp(0.0, 1.0),
                     );
                 }
             }
@@ -967,7 +1244,13 @@ fn draw_video_editor(
                                 .clicked()
                             {
                                 let time = frame_time(*playhead_frame, project.frame_rate);
-                                add_keyframe(project, time, 0.5, 0.5);
+                                let (offset_x, offset_y) = camera_motion_offset(project, time);
+                                add_keyframe(
+                                    project,
+                                    time,
+                                    (0.5 - offset_x).clamp(0.0, 1.0),
+                                    (0.5 - offset_y).clamp(0.0, 1.0),
+                                );
                             }
                         });
                     }
@@ -1266,7 +1549,7 @@ fn draw_preview_tracer(
     glow_texture: &mut Option<egui::TextureHandle>,
 ) {
     let (width, glow) = scaled_tracer_dimensions(&project.tracer, rect.height());
-    let points = trail_points(&project.keyframes, time, project.path_smoothing);
+    let points = project_trail_points(project, time);
     let raster_scale = PREVIEW_MAX_DIMENSION as f32 / rect.width().max(rect.height()).max(1.0);
     let raster_width = (rect.width() * raster_scale).round().max(1.0) as u32;
     let raster_height = (rect.height() * raster_scale).round().max(1.0) as u32;
@@ -1662,6 +1945,227 @@ fn decode_preview_frame(bytes: &[u8]) -> Result<PreviewFrame, String> {
     })
 }
 
+fn analyze_camera_motion(
+    project: &Project,
+    cancelled: &AtomicBool,
+    mut report_progress: impl FnMut(usize, usize),
+) -> Result<Vec<CameraMotionSample>, String> {
+    const ANALYSIS_MAX_DIMENSION: u32 = 320;
+    let width = probe_video_dimension(&project.video_path, "width")?;
+    let height = probe_video_dimension(&project.video_path, "height")?;
+    if width == 0 || height == 0 || project.trim_out <= project.trim_in {
+        return Err("The selected video trim cannot be analyzed.".to_owned());
+    }
+    let scale = (ANALYSIS_MAX_DIMENSION as f32 / width.max(height) as f32).min(1.0);
+    let analysis_width = (width as f32 * scale).round().max(1.0) as u32;
+    let analysis_height = (height as f32 * scale).round().max(1.0) as u32;
+    let frame_size = (analysis_width * analysis_height) as usize;
+    let duration = project.trim_out - project.trim_in;
+    let expected_frames = expected_motion_analysis_samples(duration);
+
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-ss"])
+        .arg(format!("{:.6}", project.trim_in))
+        .arg("-i")
+        .arg(&project.video_path)
+        .arg("-t")
+        .arg(format!("{duration:.6}"))
+        .arg("-vf")
+        .arg(format!(
+            "fps={MOTION_ANALYSIS_FPS},scale={analysis_width}:{analysis_height}:flags=area,format=gray"
+        ))
+        .args(["-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Could not start FFmpeg camera-motion analysis: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Could not read FFmpeg motion-analysis frames.".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Could not read FFmpeg motion-analysis errors.".to_owned())?;
+    let stderr_reader = std::thread::Builder::new()
+        .name("opentracer-motion-errors".to_owned())
+        .spawn(move || {
+            let mut output = Vec::new();
+            BufReader::new(stderr)
+                .read_to_end(&mut output)
+                .map(|_| output)
+        })
+        .map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            format!("Could not start FFmpeg error reader: {error}")
+        })?;
+    let mut reader = BufReader::new(stdout);
+    let mut samples = Vec::with_capacity(expected_frames);
+    let mut previous_frame: Option<Vec<u8>> = None;
+    let mut cumulative_x = 0.0_f32;
+    let mut cumulative_y = 0.0_f32;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Err("Camera-motion analysis was cancelled.".to_owned());
+        }
+        let frame = match read_raw_frame(&mut reader, frame_size) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(format!("Could not read motion-analysis frame: {error}"));
+            }
+        };
+
+        if let Some(previous) = &previous_frame {
+            let (delta_x, delta_y) =
+                estimate_frame_translation(previous, &frame, analysis_width, analysis_height);
+            cumulative_x = (cumulative_x + delta_x as f32).clamp(
+                -(analysis_width as f32 * 0.15),
+                analysis_width as f32 * 0.15,
+            );
+            cumulative_y = (cumulative_y + delta_y as f32).clamp(
+                -(analysis_height as f32 * 0.15),
+                analysis_height as f32 * 0.15,
+            );
+        }
+        let sample_index = samples.len();
+        samples.push(CameraMotionSample {
+            time: project.trim_in + sample_index as f32 / MOTION_ANALYSIS_FPS as f32,
+            x: cumulative_x / analysis_width as f32,
+            y: cumulative_y / analysis_height as f32,
+        });
+        previous_frame = Some(frame);
+        report_progress(samples.len().min(expected_frames), expected_frames);
+    }
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("Could not finish FFmpeg motion analysis: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "FFmpeg error reader stopped unexpectedly.".to_owned())?
+        .map_err(|error| format!("Could not read FFmpeg camera-motion errors: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "FFmpeg camera-motion analysis failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
+    if samples.is_empty() {
+        return Err("FFmpeg returned no frames for motion analysis.".to_owned());
+    }
+    report_progress(samples.len(), samples.len());
+    Ok(samples)
+}
+
+fn read_raw_frame(reader: &mut impl Read, frame_size: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let mut frame = vec![0_u8; frame_size];
+    let first_read = reader.read(&mut frame[..1])?;
+    if first_read == 0 {
+        return Ok(None);
+    }
+    reader.read_exact(&mut frame[1..])?;
+    Ok(Some(frame))
+}
+
+fn estimate_frame_translation(
+    previous: &[u8],
+    current: &[u8],
+    width: u32,
+    height: u32,
+) -> (i32, i32) {
+    const SEARCH_RADIUS: i32 = 12;
+    const SAMPLE_STEP: u32 = 4;
+    const MAX_PIXEL_DIFFERENCE: u8 = 48;
+    if width <= (SEARCH_RADIUS * 2) as u32 || height <= (SEARCH_RADIUS * 2) as u32 {
+        return (0, 0);
+    }
+
+    let mut best = (u64::MAX, 0, 0);
+    let mut second_best = u64::MAX;
+    for delta_y in -SEARCH_RADIUS..=SEARCH_RADIUS {
+        for delta_x in -SEARCH_RADIUS..=SEARCH_RADIUS {
+            let mut error = 0_u64;
+            let mut count = 0_u64;
+            let y_start = SEARCH_RADIUS as u32;
+            let y_end = height - SEARCH_RADIUS as u32;
+            let x_start = SEARCH_RADIUS as u32;
+            let x_end = width - SEARCH_RADIUS as u32;
+            for y in (y_start..y_end).step_by(SAMPLE_STEP as usize) {
+                for x in (x_start..x_end).step_by(SAMPLE_STEP as usize) {
+                    let previous_index = (y * width + x) as usize;
+                    let current_x = (x as i32 + delta_x) as u32;
+                    let current_y = (y as i32 + delta_y) as u32;
+                    let current_index = (current_y * width + current_x) as usize;
+                    error += previous[previous_index]
+                        .abs_diff(current[current_index])
+                        .min(MAX_PIXEL_DIFFERENCE) as u64;
+                    count += 1;
+                }
+            }
+            let score = error / count.max(1);
+            if score < best.0 {
+                second_best = best.0;
+                best = (score, delta_x, delta_y);
+            } else if score < second_best {
+                second_best = score;
+            }
+        }
+    }
+
+    if best.1.abs() == SEARCH_RADIUS
+        || best.2.abs() == SEARCH_RADIUS
+        || second_best.saturating_sub(best.0) < 1
+    {
+        (0, 0)
+    } else {
+        (best.1, best.2)
+    }
+}
+
+fn camera_motion_offset(project: &Project, time: f32) -> (f32, f32) {
+    if !project.camera_motion_enabled || project.camera_motion.is_empty() {
+        return (0.0, 0.0);
+    }
+    let samples = &project.camera_motion;
+    let upper = samples.partition_point(|sample| sample.time < time);
+    if upper == 0 {
+        return (samples[0].x, samples[0].y);
+    }
+    if upper >= samples.len() {
+        let last = samples.last().expect("non-empty camera motion");
+        return (last.x, last.y);
+    }
+    let before = &samples[upper - 1];
+    let after = &samples[upper];
+    let span = after.time - before.time;
+    if span <= 0.0 {
+        return (after.x, after.y);
+    }
+    let amount = ((time - before.time) / span).clamp(0.0, 1.0);
+    (
+        before.x + (after.x - before.x) * amount,
+        before.y + (after.y - before.y) * amount,
+    )
+}
+
+fn project_trail_points(project: &Project, time: f32) -> Vec<(f32, f32)> {
+    let mut points = trail_points(&project.keyframes, time, project.path_smoothing);
+    let (offset_x, offset_y) = camera_motion_offset(project, time);
+    for (x, y) in &mut points {
+        *x += offset_x;
+        *y += offset_y;
+    }
+    points
+}
+
 fn stop_preview_process(playback: &mut Option<PlaybackStream>) {
     if let Some(mut stream) = playback.take() {
         let _ = stream.child.kill();
@@ -1802,13 +2306,12 @@ fn render_overlay_frames(
     if duration <= 0.0 {
         return Err("Selected trim has no duration.".to_owned());
     }
-    let keys = &project.keyframes;
     let rgb = project.tracer.color;
     let (line_width, glow) = scaled_tracer_dimensions(&project.tracer, height as f32);
     let mut last_report = Instant::now();
     for frame_index in 0..frames {
         let time = project.trim_in + frame_index as f32 / EXPORT_FPS as f32;
-        let points = trail_points(keys, time, project.path_smoothing);
+        let points = project_trail_points(project, time);
         let mut image = RgbaImage::new(width, height);
         let line_color = Rgba([rgb[0], rgb[1], rgb[2], 255]);
         let scaled: Vec<(f32, f32)> = points
@@ -2148,13 +2651,16 @@ fn apply_app_theme(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::{
-        draw_feathered_path, frame_time, internal_to_style_scale, playback_frame_deadline,
-        preview_stream_is_ready, read_mjpeg_frame, scaled_tracer_dimensions, smooth_keyframes,
-        snap_trim_time, style_scale_to_internal, time_to_frame, timeline_range, trail_points,
-        Keyframe, TracerStyle, TRACER_GLOW_MAX, TRACER_WIDTH_MAX,
+        camera_motion_offset, draw_feathered_path, estimate_frame_translation,
+        expected_motion_analysis_samples, frame_time, internal_to_style_scale,
+        playback_frame_deadline, preview_stream_is_ready, project_trail_points, read_mjpeg_frame,
+        scaled_tracer_dimensions, smooth_keyframes, snap_trim_time, style_scale_to_internal,
+        time_to_frame, timeline_range, trail_points, CameraMotionSample, Keyframe, Project,
+        TracerStyle, TRACER_GLOW_MAX, TRACER_WIDTH_MAX,
     };
     use image::{Rgba, RgbaImage};
     use std::io::Cursor;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2263,6 +2769,90 @@ mod tests {
         let (x, y) = points.last().copied().expect("interpolated point");
         assert!((x - 0.5).abs() < 0.0001);
         assert!((y - 0.5625).abs() < 0.0001);
+    }
+
+    #[test]
+    fn camera_motion_estimator_detects_small_scene_translations() {
+        let (width, height) = (128_u32, 96_u32);
+        let mut previous = vec![0_u8; (width * height) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                previous[(y * width + x) as usize] = ((x * 73 + y * 29 + x * y * 17) % 251) as u8;
+            }
+        }
+        let mut current = vec![0_u8; previous.len()];
+        for y in 0..height - 2 {
+            for x in 0..width - 3 {
+                current[(y * width + x + 3) as usize] = previous[((y + 2) * width + x) as usize];
+            }
+        }
+        assert_eq!(
+            estimate_frame_translation(&previous, &current, width, height),
+            (3, -2)
+        );
+    }
+
+    #[test]
+    fn ten_fps_motion_analysis_reports_samples_for_the_selected_duration() {
+        assert_eq!(expected_motion_analysis_samples(23.56), 236);
+        assert_eq!(expected_motion_analysis_samples(20.0), 200);
+    }
+
+    #[test]
+    fn camera_motion_offsets_the_tracer_and_can_be_disabled() {
+        let mut project = Project {
+            video_path: PathBuf::new(),
+            duration: 2.0,
+            frame_rate: 30.0,
+            trim_in: 0.0,
+            trim_out: 2.0,
+            keyframes: vec![Keyframe {
+                time: 0.0,
+                x: 0.3,
+                y: 0.4,
+            }],
+            camera_motion: vec![
+                CameraMotionSample {
+                    time: 0.0,
+                    x: 0.0,
+                    y: 0.0,
+                },
+                CameraMotionSample {
+                    time: 1.0,
+                    x: 0.1,
+                    y: -0.05,
+                },
+            ],
+            camera_motion_enabled: true,
+            path_smoothing: 0.5,
+            tracer: TracerStyle::default(),
+        };
+        let points = project_trail_points(&project, 0.5);
+        assert!((points[0].0 - 0.35).abs() < 0.0001);
+        assert!((points[0].1 - 0.375).abs() < 0.0001);
+
+        project.camera_motion_enabled = false;
+        assert_eq!(camera_motion_offset(&project, 0.5), (0.0, 0.0));
+        assert_eq!(project_trail_points(&project, 0.5), vec![(0.3, 0.4)]);
+    }
+
+    #[test]
+    fn older_projects_default_to_motion_compensation_disabled() {
+        let project: Project = serde_json::from_str(
+            r#"{
+                "video_path": "practice.mp4",
+                "duration": 5.0,
+                "frame_rate": 30.0,
+                "trim_in": 0.0,
+                "trim_out": 5.0,
+                "keyframes": [],
+                "path_smoothing": 0.5,
+                "tracer": {"color": [255, 76, 48], "width": 5.0, "glow": 10.0}
+            }"#,
+        )
+        .expect("legacy project should remain loadable");
+        assert!(!project.camera_motion_enabled);
+        assert!(project.camera_motion.is_empty());
     }
 
     #[test]
