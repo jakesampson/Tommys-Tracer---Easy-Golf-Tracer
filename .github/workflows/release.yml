@@ -64,6 +64,7 @@ jobs:
           SOURCE_ARCHIVE="$RUNNER_TEMP/ffmpeg-$FFMPEG_VERSION.tar.xz"
           SOURCE_DIR="$RUNNER_TEMP/ffmpeg-$FFMPEG_VERSION"
           SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          brew install nasm
           curl --fail --location --retry 3 \
             "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" \
             --output "$SOURCE_ARCHIVE"
@@ -87,7 +88,6 @@ jobs:
               --disable-gpl \
               --disable-nonfree \
               --disable-autodetect \
-              --disable-x86asm \
               --enable-zlib \
               --enable-decoder=png \
               --enable-videotoolbox \
