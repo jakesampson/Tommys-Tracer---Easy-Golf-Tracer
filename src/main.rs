@@ -1,12 +1,13 @@
 use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -20,6 +21,11 @@ use serde::{Deserialize, Serialize};
 const EXPORT_FPS: u32 = 30;
 const FRAME_LIMIT: u32 = 60 * 60 * 30;
 const PREVIEW_MAX_DIMENSION: u32 = 720;
+const PREVIEW_FRAME_MAX_DIMENSION: u32 = 1920;
+const PREVIEW_CACHE_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+// How far ahead of the background decoder a requested frame may be before the decoder restarts there.
+const PREVIEW_FILL_LOOKAHEAD_FRAMES: u64 = 45;
+const PREVIEW_DECODE_AHEAD_FRAMES: u64 = 6;
 const MAX_CANVAS_ZOOM: f32 = 8.0;
 const TRACER_REFERENCE_HEIGHT: f32 = 1080.0;
 const TRACER_WIDTH_MAX: f32 = 16.0;
@@ -206,16 +212,13 @@ struct PreviewRequest {
     path: PathBuf,
     time: f32,
     frame_rate: f32,
+    // Inclusive frame range that should be kept cached (the trimmed clip).
+    frame_range: (u64, u64),
 }
 
 enum PreviewCommand {
     Seek(PreviewRequest),
-    Play {
-        id: u64,
-        path: PathBuf,
-        time: f32,
-        frame_rate: f32,
-    },
+    Play(PreviewRequest),
     Pause,
 }
 
@@ -230,15 +233,6 @@ struct PreviewResult {
 struct PreviewFrame {
     size: [usize; 2],
     rgba: Vec<u8>,
-}
-
-struct PlaybackStream {
-    child: Child,
-    frames: Receiver<Result<PreviewFrame, String>>,
-    path: PathBuf,
-    id: u64,
-    time: f32,
-    frame_rate: f32,
 }
 
 enum ExportMessage {
@@ -377,6 +371,7 @@ impl TracerApp {
                 path: project.video_path.clone(),
                 time,
                 frame_rate: project.frame_rate,
+                frame_range: trimmed_frame_range(project),
             }))
         {
             self.status = format!("Could not request video preview: {error}");
@@ -395,12 +390,16 @@ impl TracerApp {
         }
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
         self.displayed_preview_id = self.preview_request_id;
-        if let Err(error) = self.preview_sender.send(PreviewCommand::Play {
-            id: self.preview_request_id,
-            path: project.video_path.clone(),
-            time: frame_time(self.playhead_frame, project.frame_rate),
-            frame_rate: project.frame_rate,
-        }) {
+        if let Err(error) = self
+            .preview_sender
+            .send(PreviewCommand::Play(PreviewRequest {
+                id: self.preview_request_id,
+                path: project.video_path.clone(),
+                time: frame_time(self.playhead_frame, project.frame_rate),
+                frame_rate: project.frame_rate,
+                frame_range: trimmed_frame_range(project),
+            }))
+        {
             self.status = format!("Could not start video preview: {error}");
             return;
         }
@@ -1757,6 +1756,12 @@ fn last_frame(project: &Project) -> u64 {
     (project.duration * project.frame_rate).ceil().max(1.0) as u64 - 1
 }
 
+fn trimmed_frame_range(project: &Project) -> (u64, u64) {
+    let start = time_to_frame(project.trim_in, project.frame_rate).min(last_frame(project));
+    let end = time_to_frame(project.trim_out, project.frame_rate).min(last_frame(project));
+    (start, end.max(start))
+}
+
 fn playback_frame_deadline(started_at: Instant, frame_index: u64, frame_rate: f32) -> Instant {
     started_at + Duration::from_secs_f64(frame_index as f64 / f64::from(frame_rate))
 }
@@ -2307,11 +2312,16 @@ fn preview_worker(
     results: mpsc::SyncSender<PreviewResult>,
     repaint_context: egui::Context,
 ) {
-    let mut playback: Option<PlaybackStream> = None;
-    let mut is_playing = false;
+    let mut worker = PreviewWorker::new();
     loop {
-        let command = if is_playing {
+        let command = if worker.is_busy() {
             match commands.recv_timeout(Duration::from_millis(2)) {
+                Ok(command) => Some(command),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else if worker.is_filling() {
+            match commands.recv_timeout(Duration::from_millis(25)) {
                 Ok(command) => Some(command),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2326,230 +2336,494 @@ fn preview_worker(
             while let Ok(newer_command) = commands.try_recv() {
                 command = newer_command;
             }
-            match command {
-                PreviewCommand::Seek(request) => {
-                    is_playing = false;
-                    stop_preview_process(&mut playback);
-                    match start_preview_stream(
-                        request.id,
-                        &request.path,
-                        request.time,
-                        request.frame_rate,
-                    ) {
-                        Ok((stream, first_frame)) => {
-                            let _ = results.send(PreviewResult {
-                                id: request.id,
-                                time: request.time,
-                                result: Ok(first_frame),
-                                finished: false,
-                            });
-                            playback = Some(stream);
-                            repaint_context.request_repaint();
-                        }
-                        Err(error) => {
-                            let _ = results.send(PreviewResult {
-                                id: request.id,
-                                time: request.time,
-                                result: Err(error),
-                                finished: false,
-                            });
-                            repaint_context.request_repaint();
-                        }
-                    }
-                }
-                PreviewCommand::Play {
-                    id,
-                    path,
-                    time,
-                    frame_rate,
-                } => {
-                    let stream_is_ready = playback.as_ref().is_some_and(|stream| {
-                        preview_stream_is_ready(
-                            &stream.path,
-                            stream.time,
-                            stream.frame_rate,
-                            &path,
-                            time,
-                            frame_rate,
-                        )
-                    });
-                    if stream_is_ready {
-                        if let Some(stream) = &mut playback {
-                            stream.id = id;
-                        }
-                        is_playing = true;
-                    } else {
-                        stop_preview_process(&mut playback);
-                        match start_preview_stream(id, &path, time, frame_rate) {
-                            Ok((stream, first_frame)) => {
-                                let _ = results.send(PreviewResult {
-                                    id,
-                                    time,
-                                    result: Ok(first_frame),
-                                    finished: false,
-                                });
-                                playback = Some(stream);
-                                is_playing = true;
-                                repaint_context.request_repaint();
-                            }
-                            Err(error) => {
-                                let _ = results.send(PreviewResult {
-                                    id,
-                                    time,
-                                    result: Err(error),
-                                    finished: false,
-                                });
-                                is_playing = false;
-                                repaint_context.request_repaint();
-                            }
-                        }
-                    }
-                }
-                PreviewCommand::Pause => {
-                    is_playing = false;
-                }
-            }
-            continue;
+            worker.handle_command(command);
         }
-
-        if is_playing {
-            if let Some(stream) = playback.as_mut() {
-                match stream.frames.try_recv() {
-                    Ok(frame) => {
-                        let frame_time = stream.time;
-                        stream.time += 1.0 / stream.frame_rate;
-                        let _ = results.try_send(PreviewResult {
-                            id: stream.id,
-                            time: frame_time,
-                            result: frame,
-                            finished: false,
-                        });
-                        repaint_context.request_repaint();
-                        if stream.child.try_wait().ok().flatten().is_some() {
-                            let _ = results.send(PreviewResult {
-                                id: stream.id,
-                                time: stream.time,
-                                result: Ok(PreviewFrame::default()),
-                                finished: true,
-                            });
-                            repaint_context.request_repaint();
-                            playback = None;
-                            is_playing = false;
-                        }
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        if stream.child.try_wait().ok().flatten().is_some() {
-                            let _ = results.send(PreviewResult {
-                                id: stream.id,
-                                time: stream.time,
-                                result: Ok(PreviewFrame::default()),
-                                finished: true,
-                            });
-                            repaint_context.request_repaint();
-                            playback = None;
-                            is_playing = false;
-                        }
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
+        worker.maintain_fill();
+        if let Some(message) = worker.step_foreground() {
+            match message {
+                ForegroundMessage::Reliable(result) => {
+                    let _ = results.send(result);
                 }
-            } else {
-                is_playing = false;
+                ForegroundMessage::Droppable(result) => {
+                    let _ = results.try_send(result);
+                }
             }
+            repaint_context.request_repaint();
         }
     }
-    stop_preview_process(&mut playback);
+    worker.stop_filler();
 }
 
-fn start_preview_stream(
-    id: u64,
-    path: &Path,
-    time: f32,
-    frame_rate: f32,
-) -> Result<(PlaybackStream, PreviewFrame), String> {
-    let mut child = multimedia_tool_command("ffmpeg")?
-        .args([
-            "-v",
-            "error",
-            "-threads",
-            "1",
-            "-filter_threads",
-            "1",
-            "-ss",
-        ])
-        .arg(format!("{time:.6}"))
-        .arg("-i")
-        .arg(path)
-        .args(["-an", "-sn", "-dn", "-vf"])
-        .arg(format!(
-            "fps={frame_rate:.6},scale={PREVIEW_MAX_DIMENSION}:{PREVIEW_MAX_DIMENSION}:force_original_aspect_ratio=decrease"
-        ))
-        .args([
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "-flush_packets",
-            "1",
-            "pipe:1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("Could not start FFmpeg playback preview: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Could not read FFmpeg playback frames.".to_owned())?;
-    let (sender, frames) = mpsc::sync_channel(2);
-    let reader_thread = std::thread::Builder::new()
-        .name("opentracer-frame-reader".to_owned())
-        .spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut buffered = Vec::new();
-            let started_at = Instant::now();
-            let mut frame_index = 0;
-            while let Ok(Some(bytes)) = read_mjpeg_frame(&mut reader, &mut buffered) {
-                let frame = decode_preview_frame(&bytes);
-                let failed = frame.is_err();
-                let deadline = playback_frame_deadline(started_at, frame_index, frame_rate);
-                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-                if sender.send(frame).is_err() || failed {
-                    break;
-                }
-                frame_index += 1;
-            }
-        });
-    if let Err(error) = reader_thread {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(format!("Could not start video frame reader: {error}"));
+enum ForegroundMessage {
+    Reliable(PreviewResult),
+    Droppable(PreviewResult),
+}
+
+enum Foreground {
+    Idle,
+    Seek {
+        id: u64,
+        frame: u64,
+    },
+    Play {
+        id: u64,
+        frame: u64,
+        clock_start: Instant,
+        clock_frame: u64,
+    },
+}
+
+struct PreviewWorker {
+    cache: Arc<Mutex<FrameCache>>,
+    source: Option<(PathBuf, f32)>,
+    frame_range: (u64, u64),
+    filled_range: Option<(u64, u64)>,
+    filler: Option<FrameFiller>,
+    queue: VecDeque<(u64, u64)>,
+    last_restart: Option<u64>,
+    foreground: Foreground,
+    decoded: HashMap<u64, Receiver<Result<PreviewFrame, String>>>,
+}
+
+impl PreviewWorker {
+    fn new() -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(FrameCache::new(PREVIEW_CACHE_BUDGET_BYTES))),
+            source: None,
+            frame_range: (0, 0),
+            filled_range: None,
+            filler: None,
+            queue: VecDeque::new(),
+            last_restart: None,
+            foreground: Foreground::Idle,
+            decoded: HashMap::new(),
+        }
     }
-    let first_frame = match frames.recv() {
-        Ok(Ok(frame)) => frame,
-        Ok(Err(error)) => {
+
+    fn is_busy(&self) -> bool {
+        !matches!(self.foreground, Foreground::Idle)
+    }
+
+    fn is_filling(&self) -> bool {
+        self.filler.is_some()
+            || !self.queue.is_empty()
+            || self.source.is_some() && self.filled_range != Some(self.frame_range)
+    }
+
+    fn frame_rate(&self) -> f32 {
+        self.source.as_ref().map_or(30.0, |(_, rate)| *rate)
+    }
+
+    fn stop_filler(&mut self) {
+        if let Some(mut filler) = self.filler.take() {
+            filler.stop();
+        }
+    }
+
+    fn handle_command(&mut self, command: PreviewCommand) {
+        self.decoded.clear();
+        match command {
+            PreviewCommand::Seek(request) => {
+                let frame = self.begin_request(&request);
+                self.foreground = Foreground::Seek {
+                    id: request.id,
+                    frame,
+                };
+            }
+            PreviewCommand::Play(request) => {
+                let frame = self.begin_request(&request);
+                self.foreground = Foreground::Play {
+                    id: request.id,
+                    frame,
+                    clock_start: Instant::now(),
+                    clock_frame: frame,
+                };
+            }
+            PreviewCommand::Pause => self.foreground = Foreground::Idle,
+        }
+    }
+
+    fn begin_request(&mut self, request: &PreviewRequest) -> u64 {
+        let same_source = self.source.as_ref().is_some_and(|(path, rate)| {
+            path == &request.path && (rate - request.frame_rate).abs() < 0.001
+        });
+        if !same_source {
+            self.stop_filler();
+            self.queue.clear();
+            self.filled_range = None;
+            self.last_restart = None;
+            lock_cache(&self.cache).clear();
+            self.source = Some((request.path.clone(), request.frame_rate));
+        }
+        self.frame_range = request.frame_range;
+        let frame = time_to_frame(request.time, request.frame_rate);
+        lock_cache(&self.cache).focus = frame;
+        frame
+    }
+
+    fn maintain_fill(&mut self) {
+        if self
+            .filler
+            .as_ref()
+            .is_some_and(|filler| filler.is_finished())
+        {
+            self.stop_filler();
+        }
+        if self.filler.is_some() {
+            return;
+        }
+        let Some((path, frame_rate)) = self.source.clone() else {
+            return;
+        };
+        if self.queue.is_empty() && self.filled_range != Some(self.frame_range) {
+            let (start, end) = self.frame_range;
+            let focus = lock_cache(&self.cache).focus.clamp(start, end);
+            self.queue.push_back((focus, end));
+            if focus > start {
+                self.queue.push_back((start, focus - 1));
+            }
+            self.filled_range = Some(self.frame_range);
+        }
+        while let Some((start, end)) = self.queue.pop_front() {
+            let Some((start, end)) = lock_cache(&self.cache).uncached_span(start, end) else {
+                continue;
+            };
+            if let Ok(filler) =
+                FrameFiller::start(&path, frame_rate, start, end, Arc::clone(&self.cache))
+            {
+                self.filler = Some(filler);
+                break;
+            }
+        }
+    }
+
+    // Makes sure a decoder is producing `frame` soon. Err means it can never be produced.
+    fn ensure_frame_fill(&mut self, frame: u64) -> Result<(), String> {
+        let active = self
+            .filler
+            .as_ref()
+            .is_some_and(|filler| !filler.is_finished());
+        if let Some(filler) = self.filler.as_ref().filter(|_| active) {
+            let progress = filler.progress();
+            if frame >= progress
+                && frame <= filler.end
+                && frame - progress <= PREVIEW_FILL_LOOKAHEAD_FRAMES
+            {
+                return Ok(());
+            }
+        }
+        if self.last_restart == Some(frame) {
+            return if active || !self.queue.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Frame {frame} could not be decoded from the video."
+                ))
+            };
+        }
+        self.last_restart = Some(frame);
+        self.stop_filler();
+        self.queue.clear();
+        let (start, end) = self.frame_range;
+        let (start, end) = (start.min(frame), end.max(frame));
+        self.queue.push_back((frame, end));
+        if frame > start {
+            self.queue.push_back((start, frame - 1));
+        }
+        self.filled_range = Some(self.frame_range);
+        self.maintain_fill();
+        if self.filler.is_none() {
+            return Err("Could not start FFmpeg preview decoding.".to_owned());
+        }
+        Ok(())
+    }
+
+    fn cached_frame(&self, frame: u64) -> Option<Arc<Vec<u8>>> {
+        lock_cache(&self.cache).get(frame)
+    }
+
+    // JPEG decoding is slower than a 60 fps frame period, so upcoming frames decode in parallel.
+    fn start_decode_ahead(&mut self, from: u64) {
+        self.decoded.retain(|frame, _| *frame >= from);
+        let last = self
+            .frame_range
+            .1
+            .min(from + PREVIEW_DECODE_AHEAD_FRAMES - 1);
+        for frame in from..=last {
+            if self.decoded.contains_key(&frame) {
+                continue;
+            }
+            let Some(bytes) = self.cached_frame(frame) else {
+                break;
+            };
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(decode_preview_frame(&bytes));
+            });
+            self.decoded.insert(frame, receiver);
+        }
+    }
+
+    fn decoded_frame(&mut self, frame: u64, bytes: &[u8]) -> Result<PreviewFrame, String> {
+        match self.decoded.remove(&frame) {
+            Some(receiver) => receiver
+                .recv()
+                .unwrap_or_else(|_| decode_preview_frame(bytes)),
+            None => decode_preview_frame(bytes),
+        }
+    }
+
+    fn step_foreground(&mut self) -> Option<ForegroundMessage> {
+        let frame_rate = self.frame_rate();
+        match self.foreground {
+            Foreground::Idle => None,
+            Foreground::Seek { id, frame } => {
+                if let Some(bytes) = self.cached_frame(frame) {
+                    self.foreground = Foreground::Idle;
+                    return Some(ForegroundMessage::Reliable(PreviewResult {
+                        id,
+                        time: frame_time(frame, frame_rate),
+                        result: decode_preview_frame(&bytes),
+                        finished: false,
+                    }));
+                }
+                match self.ensure_frame_fill(frame) {
+                    Ok(()) => None,
+                    Err(error) => {
+                        self.foreground = Foreground::Idle;
+                        Some(ForegroundMessage::Reliable(PreviewResult {
+                            id,
+                            time: frame_time(frame, frame_rate),
+                            result: Err(error),
+                            finished: false,
+                        }))
+                    }
+                }
+            }
+            Foreground::Play {
+                id,
+                frame,
+                clock_start,
+                clock_frame,
+            } => {
+                if frame > self.frame_range.1 {
+                    self.foreground = Foreground::Idle;
+                    return Some(ForegroundMessage::Reliable(PreviewResult {
+                        id,
+                        time: frame_time(frame, frame_rate),
+                        result: Ok(PreviewFrame::default()),
+                        finished: true,
+                    }));
+                }
+                lock_cache(&self.cache).focus = frame;
+                self.start_decode_ahead(frame);
+                let deadline =
+                    playback_frame_deadline(clock_start, frame - clock_frame, frame_rate);
+                if Instant::now() < deadline {
+                    return None;
+                }
+                if let Some(bytes) = self.cached_frame(frame) {
+                    self.foreground = Foreground::Play {
+                        id,
+                        frame: frame + 1,
+                        clock_start,
+                        clock_frame,
+                    };
+                    return Some(ForegroundMessage::Droppable(PreviewResult {
+                        id,
+                        time: frame_time(frame, frame_rate),
+                        result: self.decoded_frame(frame, &bytes),
+                        finished: false,
+                    }));
+                }
+                // Decoding is behind playback: hold the clock until the frame arrives.
+                self.foreground = Foreground::Play {
+                    id,
+                    frame,
+                    clock_start: Instant::now(),
+                    clock_frame: frame,
+                };
+                match self.ensure_frame_fill(frame) {
+                    Ok(()) => None,
+                    Err(_) => {
+                        self.foreground = Foreground::Idle;
+                        Some(ForegroundMessage::Reliable(PreviewResult {
+                            id,
+                            time: frame_time(frame, frame_rate),
+                            result: Ok(PreviewFrame::default()),
+                            finished: true,
+                        }))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn lock_cache(cache: &Mutex<FrameCache>) -> std::sync::MutexGuard<'_, FrameCache> {
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+// Compressed preview frames kept in memory; frames far from the playhead are evicted first.
+struct FrameCache {
+    frames: BTreeMap<u64, Arc<Vec<u8>>>,
+    bytes: usize,
+    budget: usize,
+    focus: u64,
+}
+
+impl FrameCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            frames: BTreeMap::new(),
+            bytes: 0,
+            budget,
+            focus: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
+    }
+
+    fn get(&self, frame: u64) -> Option<Arc<Vec<u8>>> {
+        self.frames.get(&frame).cloned()
+    }
+
+    // Returns false when the frame is farther from the playhead than everything already cached.
+    fn insert(&mut self, frame: u64, data: Vec<u8>) -> bool {
+        if let Some(old) = self.frames.remove(&frame) {
+            self.bytes -= old.len();
+        }
+        let size = data.len();
+        while self.bytes + size > self.budget {
+            let first = self.frames.keys().next().copied();
+            let last = self.frames.keys().next_back().copied();
+            let (Some(first), Some(last)) = (first, last) else {
+                return false;
+            };
+            let farthest = if self.focus.abs_diff(first) >= self.focus.abs_diff(last) {
+                first
+            } else {
+                last
+            };
+            if self.focus.abs_diff(farthest) <= self.focus.abs_diff(frame) {
+                return false;
+            }
+            if let Some(removed) = self.frames.remove(&farthest) {
+                self.bytes -= removed.len();
+            }
+        }
+        self.bytes += size;
+        self.frames.insert(frame, Arc::new(data));
+        true
+    }
+
+    // Shrinks start..=end past already cached frames at both ends.
+    fn uncached_span(&self, mut start: u64, mut end: u64) -> Option<(u64, u64)> {
+        while start <= end && self.frames.contains_key(&start) {
+            start += 1;
+        }
+        while end >= start && self.frames.contains_key(&end) {
+            end -= 1;
+        }
+        (start <= end).then_some((start, end))
+    }
+}
+
+// Background FFmpeg decode of a frame range into the cache.
+struct FrameFiller {
+    child: Child,
+    end: u64,
+    progress: Arc<AtomicU64>,
+    finished: Arc<AtomicBool>,
+}
+
+impl FrameFiller {
+    fn start(
+        path: &Path,
+        frame_rate: f32,
+        start: u64,
+        end: u64,
+        cache: Arc<Mutex<FrameCache>>,
+    ) -> Result<Self, String> {
+        let dimension = PREVIEW_FRAME_MAX_DIMENSION;
+        let mut command = multimedia_tool_command("ffmpeg")?;
+        command.args(["-v", "error"]);
+        if cfg!(target_os = "macos") {
+            command.args(["-hwaccel", "videotoolbox"]);
+        }
+        let mut child = command
+            .arg("-ss")
+            .arg(format!("{:.6}", frame_time(start, frame_rate)))
+            .arg("-i")
+            .arg(path)
+            .args(["-an", "-sn", "-dn", "-vf"])
+            .arg(format!(
+                "fps={frame_rate:.6},scale='if(gt(iw,ih),min({dimension},iw),-2)':'if(gt(iw,ih),-2,min({dimension},ih))'"
+            ))
+            .arg("-frames:v")
+            .arg((end - start + 1).to_string())
+            .args(["-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Could not start FFmpeg preview decoding: {error}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Could not read FFmpeg preview frames.".to_owned())?;
+        let progress = Arc::new(AtomicU64::new(start));
+        let finished = Arc::new(AtomicBool::new(false));
+        let thread_progress = Arc::clone(&progress);
+        let thread_finished = Arc::clone(&finished);
+        let spawned = std::thread::Builder::new()
+            .name("opentracer-frame-filler".to_owned())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                let mut buffered = Vec::new();
+                let mut frame = start;
+                while frame <= end {
+                    let Ok(Some(bytes)) = read_mjpeg_frame(&mut reader, &mut buffered) else {
+                        break;
+                    };
+                    let accepted = lock_cache(&cache).insert(frame, bytes);
+                    frame += 1;
+                    thread_progress.store(frame, Ordering::Release);
+                    if !accepted {
+                        break;
+                    }
+                }
+                thread_finished.store(true, Ordering::Release);
+            });
+        if let Err(error) = spawned {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(error);
+            return Err(format!("Could not start video frame reader: {error}"));
         }
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "Could not read first FFmpeg preview frame: {error}"
-            ));
-        }
-    };
-    Ok((
-        PlaybackStream {
+        Ok(Self {
             child,
-            frames,
-            path: path.to_path_buf(),
-            id,
-            time: time + 1.0 / frame_rate,
-            frame_rate,
-        },
-        first_frame,
-    ))
+            end,
+            progress,
+            finished,
+        })
+    }
+
+    fn progress(&self) -> u64 {
+        self.progress.load(Ordering::Acquire)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn decode_preview_frame(bytes: &[u8]) -> Result<PreviewFrame, String> {
@@ -2789,40 +3063,11 @@ fn project_trail_points(project: &Project, time: f32) -> Vec<(f32, f32)> {
     points
 }
 
-fn stop_preview_process(playback: &mut Option<PlaybackStream>) {
-    if let Some(mut stream) = playback.take() {
-        let _ = stream.child.kill();
-        let _ = stream.child.wait();
-    }
-}
-
-fn preview_stream_is_ready(
-    stream_path: &Path,
-    next_frame_time: f32,
-    stream_frame_rate: f32,
-    requested_path: &Path,
-    requested_time: f32,
-    frame_rate: f32,
-) -> bool {
-    if !frame_rate.is_finite()
-        || frame_rate <= 0.0
-        || stream_path != requested_path
-        || (stream_frame_rate - frame_rate).abs() > 0.001
-    {
-        return false;
-    }
-    let first_expected_time = requested_time + 1.0 / frame_rate;
-    let half_frame = 0.5 / frame_rate;
-    let buffered_frames = 4.0;
-    next_frame_time >= first_expected_time - half_frame
-        && next_frame_time <= first_expected_time + buffered_frames / frame_rate
-}
-
 fn read_mjpeg_frame(
     reader: &mut impl Read,
     buffered: &mut Vec<u8>,
 ) -> std::io::Result<Option<Vec<u8>>> {
-    const CHUNK_SIZE: usize = 8192;
+    const CHUNK_SIZE: usize = 64 * 1024;
     const MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
     let mut chunk = [0_u8; CHUNK_SIZE];
     loop {
@@ -3363,13 +3608,13 @@ mod tests {
         camera_motion_offset, default_trail_duration, default_trail_pace, draw_feathered_path,
         ensure_keyframe_at_time, estimate_frame_translation, expected_motion_analysis_samples,
         frame_time, internal_to_style_scale, keyframe_index_at_time, parse_frame_rate,
-        parse_video_dimension, playback_frame_deadline, position_on_path, preview_stream_is_ready,
+        parse_video_dimension, playback_frame_deadline, position_on_path,
         preview_tracer_zoom_scale, project_trail_points, read_mjpeg_frame,
         scaled_tracer_dimensions, smooth_keyframes, snap_trim_time, step_frame,
         style_scale_to_internal, time_to_frame, timeline_range, trace_nudge_pixels,
         trail_cutoff_time, trail_pace_index, trail_points, zoom_pan_for_cursor,
-        zoomed_preview_rect, CameraMotionSample, Keyframe, Project, TracerStyle, MAX_CANVAS_ZOOM,
-        TRACER_GLOW_MAX, TRACER_WIDTH_MAX,
+        zoomed_preview_rect, CameraMotionSample, FrameCache, Keyframe, Project, TracerStyle,
+        MAX_CANVAS_ZOOM, TRACER_GLOW_MAX, TRACER_WIDTH_MAX,
     };
     use eframe::egui::{Pos2, Rect, Vec2};
     use image::{Rgba, RgbaImage};
@@ -3905,43 +4150,99 @@ mod tests {
     }
 
     #[test]
-    fn paused_preview_stream_is_reused_only_for_nearby_frames() {
-        let path = std::path::Path::new("/video.mov");
-        let frame_rate = 30.0;
-        let requested_time = 2.0;
-        let next_frame_time = requested_time + 1.0 / frame_rate;
-        assert!(preview_stream_is_ready(
-            path,
-            next_frame_time,
-            frame_rate,
-            path,
-            requested_time,
-            frame_rate,
-        ));
-        assert!(preview_stream_is_ready(
-            path,
-            next_frame_time + 3.0 / frame_rate,
-            frame_rate,
-            path,
-            requested_time,
-            frame_rate,
-        ));
-        assert!(!preview_stream_is_ready(
-            path,
-            next_frame_time + 5.0 / frame_rate,
-            frame_rate,
-            path,
-            requested_time,
-            frame_rate,
-        ));
-        assert!(!preview_stream_is_ready(
-            path,
-            next_frame_time,
-            frame_rate,
-            std::path::Path::new("/other.mov"),
-            requested_time,
-            frame_rate,
-        ));
+    fn frame_cache_evicts_the_frames_farthest_from_the_playhead() {
+        let mut cache = FrameCache::new(30);
+        cache.focus = 5;
+        for frame in 0..3 {
+            assert!(cache.insert(frame, vec![0; 10]));
+        }
+        assert!(cache.insert(5, vec![0; 10]));
+        assert!(cache.get(0).is_none());
+        assert!(cache.get(1).is_some() && cache.get(2).is_some() && cache.get(5).is_some());
+        assert!(!cache.insert(100, vec![0; 10]));
+        assert!(cache.get(100).is_none());
+        assert_eq!(cache.bytes, 30);
+    }
+
+    #[test]
+    #[ignore = "needs FFmpeg and OPENTRACER_TEST_VIDEO pointing at a video"]
+    fn preview_worker_serves_seeks_and_playback_from_the_frame_cache() {
+        let Ok(video) = std::env::var("OPENTRACER_TEST_VIDEO") else {
+            return;
+        };
+        let (command_sender, commands) = std::sync::mpsc::channel();
+        let (results, receiver) = std::sync::mpsc::sync_channel(2);
+        std::thread::spawn(move || {
+            super::preview_worker(commands, results, eframe::egui::Context::default())
+        });
+        let request = |id: u64, frame: u64| super::PreviewRequest {
+            id,
+            path: PathBuf::from(&video),
+            time: frame as f32 / 30.0,
+            frame_rate: 30.0,
+            frame_range: (0, 150),
+        };
+        let wait = |id: u64| loop {
+            let result = receiver
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("preview result");
+            if result.id == id {
+                return result;
+            }
+        };
+
+        let started = Instant::now();
+        command_sender
+            .send(super::PreviewCommand::Seek(request(1, 60)))
+            .unwrap();
+        let cold = wait(1);
+        println!("cold seek: {:?}", started.elapsed());
+        let frame = cold.result.expect("cold frame");
+        println!("preview size: {:?}", frame.size);
+
+        for (id, target) in [(2, 61), (3, 62)] {
+            let started = Instant::now();
+            command_sender
+                .send(super::PreviewCommand::Seek(request(id, target)))
+                .unwrap();
+            wait(id).result.expect("step frame");
+            println!("step to {target}: {:?}", started.elapsed());
+        }
+
+        // Let the background decode fill the trimmed range, then jump backwards.
+        std::thread::sleep(std::time::Duration::from_secs(40));
+        let started = Instant::now();
+        command_sender
+            .send(super::PreviewCommand::Seek(request(4, 5)))
+            .unwrap();
+        wait(4).result.expect("cached backwards seek");
+        println!("cached backwards seek: {:?}", started.elapsed());
+
+        let started = Instant::now();
+        command_sender
+            .send(super::PreviewCommand::Play(request(5, 0)))
+            .unwrap();
+        let mut frames = 0;
+        loop {
+            let result = wait(5);
+            if result.finished {
+                break;
+            }
+            frames += 1;
+        }
+        println!("played {frames} frames in {:?}", started.elapsed());
+        assert!(frames >= 140, "only {frames} frames were delivered");
+    }
+
+    #[test]
+    fn uncached_span_skips_frames_already_cached_at_both_ends() {
+        let mut cache = FrameCache::new(1000);
+        for frame in [10, 11, 19, 20] {
+            cache.insert(frame, vec![0; 1]);
+        }
+        assert_eq!(cache.uncached_span(10, 20), Some((12, 18)));
+        assert_eq!(cache.uncached_span(10, 11), None);
+        assert_eq!(cache.uncached_span(30, 31), Some((30, 31)));
     }
 
     #[test]
