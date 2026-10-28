@@ -3266,6 +3266,7 @@ fn main() -> eframe::Result<()> {
 }
 
 fn apply_app_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = Vec2::new(10.0, 9.0);
     style.spacing.button_padding = Vec2::new(12.0, 7.0);
