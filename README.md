@@ -1,6 +1,8 @@
-# OpenTracer PC
+# Tommy'sTracer - Easy Golf Tracer
 
-OpenTracer PC is a native desktop editor for Windows and macOS that trims golf videos and creates animated shot tracers.
+Tommy'sTracer - Easy Golf Tracer is a native desktop editor for Windows, macOS, and Linux that trims golf videos and creates animated shot tracers.
+
+The app icon and welcome-screen logo are bundled from `assets/branding`. Additional brand artwork and icon variations are kept in the same folder.
 
 ## Requirements
 
@@ -10,7 +12,7 @@ OpenTracer PC is a native desktop editor for Windows and macOS that trims golf v
 
 ## Install prerequisites
 
-Install Rust from [rustup.rs](https://rustup.rs/).
+Install Rust from [rustup.rs](https://rustup.rs/) to build from source.
 
 On macOS, install FFmpeg with Homebrew:
 
@@ -18,11 +20,11 @@ On macOS, install FFmpeg with Homebrew:
 brew install ffmpeg
 ```
 
-On Windows, install FFmpeg from [ffmpeg.org](https://ffmpeg.org/download.html) and ensure `ffmpeg` and `ffprobe` are on `PATH`. Install the Xcode Command Line Tools on macOS with `xcode-select --install`.
+On Windows, install FFmpeg from [ffmpeg.org](https://ffmpeg.org/download.html) and ensure `ffmpeg` and `ffprobe` are on `PATH`. Install the Xcode Command Line Tools on macOS with `xcode-select --install`. On Linux, install FFmpeg and the X11/Wayland, OpenGL, and ALSA development packages for your distribution.
 
 ## Build and run
 
-Run these commands from the project folder on either Windows or macOS:
+Run these commands from the project folder:
 
 ```sh
 cargo run
@@ -38,4 +40,15 @@ Frame navigation uses the source video's detected frame rate. Playback controls 
 
 ## Continuous integration
 
-GitHub Actions checks formatting, tests, Clippy, and native builds on Windows and macOS for pushes and pull requests.
+GitHub Actions checks formatting, tests, Clippy, and native builds on Windows, macOS, and Linux for pushes and pull requests.
+
+## GitHub releases
+
+Push a version tag to build and publish downloadable packages automatically:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow creates a Windows x86_64 ZIP, a universal macOS `.app` ZIP for Intel and Apple Silicon, and a Linux x86_64 tarball, then attaches them to a GitHub Release with generated notes. Packages include installation instructions. FFmpeg and FFprobe are external requirements and are not bundled. The macOS app is not signed or notarized, so macOS may require users to Control-click and choose **Open** the first time.

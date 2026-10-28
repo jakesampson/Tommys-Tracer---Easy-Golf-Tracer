@@ -157,6 +157,7 @@ struct TracerApp {
     preview_request_id: u64,
     displayed_preview_id: u64,
     preview: Option<egui::TextureHandle>,
+    welcome_logo: egui::TextureHandle,
     tracer_glow: Option<egui::TextureHandle>,
     preview_size: [usize; 2],
     canvas_zoom: CanvasZoom,
@@ -271,6 +272,18 @@ struct EditorInteraction {
 impl TracerApp {
     fn new(ctx: &egui::Context) -> Self {
         apply_app_theme(ctx);
+        let logo_image =
+            image::load_from_memory(include_bytes!("../assets/branding/welcome_logo.png"))
+                .expect("embedded welcome logo must be a valid image")
+                .to_rgba8();
+        let welcome_logo = ctx.load_texture(
+            "welcome-logo",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [logo_image.width() as usize, logo_image.height() as usize],
+                logo_image.as_raw(),
+            ),
+            egui::TextureOptions::LINEAR,
+        );
         let (preview_sender, preview_requests) = mpsc::channel::<PreviewCommand>();
         let (preview_results, preview_receiver) = mpsc::sync_channel::<PreviewResult>(2);
         let repaint_context = ctx.clone();
@@ -294,6 +307,7 @@ impl TracerApp {
             preview_request_id: 0,
             displayed_preview_id: 0,
             preview: None,
+            welcome_logo,
             tracer_glow: None,
             preview_size: [0, 0],
             canvas_zoom: CanvasZoom::default(),
@@ -407,7 +421,7 @@ impl TracerApp {
             return;
         };
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("OpenTracer project", &["otracer"])
+            .add_filter("Tommy's Tracer project", &["otracer"])
             .set_file_name("shot-tracer.otracer")
             .save_file()
         else {
@@ -479,7 +493,7 @@ impl TracerApp {
 
     fn load_project(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("OpenTracer project", &["otracer", "json"])
+            .add_filter("Tommy's Tracer project", &["otracer", "json"])
             .pick_file()
         else {
             return;
@@ -608,17 +622,9 @@ impl TracerApp {
                     .show(ui, |ui| {
                         ui.set_max_width(520.0);
                         ui.vertical_centered(|ui| {
-                            ui.label(
-                                egui::RichText::new("◉")
-                                    .size(48.0)
-                                    .color(Color32::from_rgb(89, 177, 255)),
-                            );
-                            ui.heading(egui::RichText::new("OpenTracer").size(36.0).strong());
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("Welcome to OpenTracer")
-                                    .size(19.0)
-                                    .color(Color32::from_rgb(192, 211, 232)),
+                            ui.add(
+                                egui::Image::new((self.welcome_logo.id(), Vec2::new(420.0, 280.0)))
+                                    .fit_to_exact_size(Vec2::new(420.0, 280.0)),
                             );
                             ui.add_space(8.0);
                             ui.label("Trace the ball flight in your golf videos, frame by frame.");
@@ -3183,14 +3189,25 @@ fn encode_export(
 }
 
 fn main() -> eframe::Result<()> {
+    let app_icon = image::load_from_memory(include_bytes!("../assets/branding/app_icon.png"))
+        .expect("embedded app icon must be a valid image")
+        .to_rgba8();
+    let app_icon =
+        image::imageops::resize(&app_icon, 256, 256, image::imageops::FilterType::Lanczos3);
+    let app_icon = egui::IconData {
+        rgba: app_icon.into_raw(),
+        width: 256,
+        height: 256,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_min_inner_size([900.0, 600.0])
+            .with_icon(app_icon),
         ..Default::default()
     };
     eframe::run_native(
-        "OpenTracer PC",
+        "Tommy'sTracer - Easy Golf Tracer",
         options,
         Box::new(|creation_context| Ok(Box::new(TracerApp::new(&creation_context.egui_ctx)))),
     )

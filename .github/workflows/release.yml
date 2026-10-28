@@ -1,0 +1,153 @@
+name: Build release packages
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Package Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item target\release\tommys-tracer.exe package\
+          Copy-Item release\README.txt package\
+          Compress-Archive -Path package\* -DestinationPath tommys-tracer-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: tommys-tracer-windows-x86_64.zip
+          if-no-files-found: error
+
+  macos:
+    name: Package macOS universal app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build universal binary
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p universal
+          lipo -create \
+            target/aarch64-apple-darwin/release/tommys-tracer \
+            target/x86_64-apple-darwin/release/tommys-tracer \
+            -output universal/tommys-tracer
+      - name: Package app
+        run: |
+          APP="Tommy's Tracer.app"
+          CONTENTS="$APP/Contents"
+          ICONSET="$RUNNER_TEMP/TommyTracer.iconset"
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$ICONSET"
+          cp universal/tommys-tracer "$CONTENTS/MacOS/tommys-tracer"
+          cp release/README.txt "$CONTENTS/Resources/README.txt"
+
+          ICON_SOURCE="assets/branding/app_icon_small_variant.png"
+          make_icon_size() {
+            sips -z "$1" "$1" "$ICON_SOURCE" --out "$ICONSET/icon_${1}x${1}.png" >/dev/null
+          }
+          make_icon_size 16
+          make_icon_size 32
+          cp "$ICONSET/icon_32x32.png" "$ICONSET/icon_16x16@2x.png"
+          make_icon_size 64
+          cp "$ICONSET/icon_64x64.png" "$ICONSET/icon_32x32@2x.png"
+          make_icon_size 128
+          make_icon_size 256
+          cp "$ICONSET/icon_256x256.png" "$ICONSET/icon_128x128@2x.png"
+          make_icon_size 512
+          cp "$ICONSET/icon_512x512.png" "$ICONSET/icon_256x256@2x.png"
+          make_icon_size 1024
+          cp "$ICONSET/icon_1024x1024.png" "$ICONSET/icon_512x512@2x.png"
+          iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/TommyTracer.icns"
+
+          cat > "$CONTENTS/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>tommys-tracer</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.tommys.tracer</string>
+            <key>CFBundleName</key>
+            <string>Tommy's Tracer</string>
+            <key>CFBundleDisplayName</key>
+            <string>Tommy'sTracer - Easy Golf Tracer</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleIconFile</key>
+            <string>TommyTracer</string>
+            <key>CFBundleShortVersionString</key>
+            <string>$VERSION</string>
+            <key>CFBundleVersion</key>
+            <string>$VERSION</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          printf 'APPL????' > "$CONTENTS/PkgInfo"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" tommys-tracer-macos-universal.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-package
+          path: tommys-tracer-macos-universal.zip
+          if-no-files-found: error
+
+  linux:
+    name: Package Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev libgl1-mesa-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-randr0-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev pkg-config
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          mkdir -p package
+          cp target/release/tommys-tracer package/
+          cp release/README.txt package/
+          tar -czf tommys-tracer-linux-x86_64.tar.gz -C package .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-package
+          path: tommys-tracer-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Tommy's Tracer $GITHUB_REF_NAME" \
+            --generate-notes

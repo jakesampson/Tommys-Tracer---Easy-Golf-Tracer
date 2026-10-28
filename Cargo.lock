@@ -2676,18 +2676,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "open-tracer-pc"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "image",
- "imageproc",
- "rfd",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3772,6 +3760,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
 dependencies = [
  "winnow",
+]
+
+[[package]]
+name = "tommys-tracer"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "image",
+ "imageproc",
+ "rfd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

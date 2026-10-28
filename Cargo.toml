@@ -1,8 +1,8 @@
 [package]
-name = "open-tracer-pc"
+name = "tommys-tracer"
 version = "0.1.0"
 edition = "2021"
-description = "A desktop golf video editor for trimming footage and creating animated shot tracers"
+description = "Tommy'sTracer - Easy Golf Tracer, a desktop golf video editor for trimming footage and creating animated shot tracers"
 license = "MIT"
 
 [dependencies]
