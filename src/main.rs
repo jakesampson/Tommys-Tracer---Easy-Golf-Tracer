@@ -26,6 +26,7 @@ const TRACER_WIDTH_MAX: f32 = 16.0;
 const TRACER_GLOW_MAX: f32 = 24.0;
 const STYLE_SCALE_MAX: i32 = 10;
 const MOTION_ANALYSIS_FPS: u32 = 10;
+const TRAIL_PACES: [f32; 3] = [0.25, 0.5, 1.0];
 
 fn expected_motion_analysis_samples(duration: f32) -> usize {
     (duration * MOTION_ANALYSIS_FPS as f32).ceil().max(1.0) as usize
@@ -53,6 +54,10 @@ struct Project {
     camera_motion_enabled: bool,
     #[serde(default = "default_path_smoothing")]
     path_smoothing: f32,
+    #[serde(default = "default_trail_duration")]
+    trail_duration: f32,
+    #[serde(default = "default_trail_pace")]
+    trail_pace: f32,
     tracer: TracerStyle,
 }
 
@@ -71,6 +76,45 @@ fn default_path_smoothing() -> f32 {
     0.5
 }
 
+fn default_trail_duration() -> f32 {
+    5.0
+}
+
+fn default_trail_pace() -> f32 {
+    0.5
+}
+
+fn trail_pace_index(pace: f32) -> i32 {
+    if !pace.is_finite() {
+        return 1;
+    }
+    TRAIL_PACES
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| (*left - pace).abs().total_cmp(&(*right - pace).abs()))
+        .map_or(1, |(index, _)| index as i32)
+}
+
+fn trail_cutoff_time(first_time: f32, time: f32, duration: f32, pace: f32) -> f32 {
+    let pace = TRAIL_PACES[trail_pace_index(pace) as usize];
+    let elapsed_after_duration = (time - first_time - duration.max(0.0)).max(0.0);
+    first_time + elapsed_after_duration * pace
+}
+
+fn trace_nudge_pixels(zoom_scale: f32, fine_nudge: bool) -> f32 {
+    if fine_nudge {
+        1.0
+    } else if zoom_scale > 4.0 {
+        5.0
+    } else {
+        10.0
+    }
+}
+
+fn default_glow_color() -> [u8; 3] {
+    [255, 76, 48]
+}
+
 fn style_scale_to_internal(value: i32, internal_max: f32) -> f32 {
     value.clamp(1, STYLE_SCALE_MAX) as f32 / STYLE_SCALE_MAX as f32 * internal_max
 }
@@ -84,6 +128,8 @@ fn internal_to_style_scale(value: f32, internal_max: f32) -> i32 {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TracerStyle {
     color: [u8; 3],
+    #[serde(default = "default_glow_color")]
+    glow_color: [u8; 3],
     width: f32,
     glow: f32,
 }
@@ -92,6 +138,7 @@ impl Default for TracerStyle {
     fn default() -> Self {
         Self {
             color: [255, 76, 48],
+            glow_color: default_glow_color(),
             width: 5.0,
             glow: 10.0,
         }
@@ -130,6 +177,7 @@ struct CanvasZoom {
     pan: Vec2,
     dragging_keyframe: bool,
     keyframe_drag_offset: Vec2,
+    keyboard_active: bool,
 }
 
 impl Default for CanvasZoom {
@@ -139,6 +187,7 @@ impl Default for CanvasZoom {
             pan: Vec2::ZERO,
             dragging_keyframe: false,
             keyframe_drag_offset: Vec2::ZERO,
+            keyboard_active: false,
         }
     }
 }
@@ -286,6 +335,8 @@ impl TracerApp {
                     camera_motion: Vec::new(),
                     camera_motion_enabled: false,
                     path_smoothing: default_path_smoothing(),
+                    trail_duration: default_trail_duration(),
+                    trail_pace: default_trail_pace(),
                     tracer: TracerStyle::default(),
                 });
                 self.canvas_zoom = CanvasZoom::default();
@@ -448,6 +499,11 @@ impl TracerApp {
                 if !project.frame_rate.is_finite() || project.frame_rate <= 0.0 {
                     project.frame_rate = default_frame_rate();
                 }
+                if !project.trail_duration.is_finite() {
+                    project.trail_duration = default_trail_duration();
+                }
+                project.trail_duration = project.trail_duration.clamp(1.0, 10.0);
+                project.trail_pace = TRAIL_PACES[trail_pace_index(project.trail_pace) as usize];
                 project.duration = project.duration.max(0.0);
                 project.trim_in = project.trim_in.clamp(0.0, project.duration);
                 project.trim_out = project.trim_out.clamp(project.trim_in, project.duration);
@@ -817,33 +873,70 @@ impl TracerApp {
                 ui.heading("Tracer style");
                 ui.add_space(8.0);
                 if let Some(project) = &mut self.project {
-                    let mut color = Color32::from_rgb(
-                        project.tracer.color[0],
-                        project.tracer.color[1],
-                        project.tracer.color[2],
-                    );
-                    if ui.color_edit_button_srgba(&mut color).changed() {
-                        project.tracer.color = [color.r(), color.g(), color.b()];
-                    }
                     let mut width_scale =
                         internal_to_style_scale(project.tracer.width, TRACER_WIDTH_MAX);
-                    if ui
-                        .add(egui::Slider::new(&mut width_scale, 1..=STYLE_SCALE_MAX).text("Width"))
-                        .on_hover_text("Style scale: 1–10, where 10 is 100%.")
-                        .changed()
-                    {
-                        project.tracer.width =
-                            style_scale_to_internal(width_scale, TRACER_WIDTH_MAX);
-                    }
+                    ui.horizontal(|ui| {
+                        let slider_width = (ui.available_width()
+                            - ui.spacing().interact_size.x
+                            - ui.spacing().item_spacing.x)
+                            .max(1.0);
+                        if ui
+                            .add_sized(
+                                [slider_width, ui.spacing().interact_size.y],
+                                egui::Slider::new(&mut width_scale, 1..=STYLE_SCALE_MAX)
+                                    .text("Width"),
+                            )
+                            .on_hover_text("Style scale: 1–10, where 10 is 100%.")
+                            .changed()
+                        {
+                            project.tracer.width =
+                                style_scale_to_internal(width_scale, TRACER_WIDTH_MAX);
+                        }
+                        let mut color = Color32::from_rgb(
+                            project.tracer.color[0],
+                            project.tracer.color[1],
+                            project.tracer.color[2],
+                        );
+                        if ui
+                            .color_edit_button_srgba(&mut color)
+                            .on_hover_text("Tracer line color")
+                            .changed()
+                        {
+                            project.tracer.color = [color.r(), color.g(), color.b()];
+                        }
+                    });
                     let mut glow_scale =
                         internal_to_style_scale(project.tracer.glow, TRACER_GLOW_MAX);
-                    if ui
-                        .add(egui::Slider::new(&mut glow_scale, 1..=STYLE_SCALE_MAX).text("Glow"))
-                        .on_hover_text("Style scale: 1–10, where 10 is 100%.")
-                        .changed()
-                    {
-                        project.tracer.glow = style_scale_to_internal(glow_scale, TRACER_GLOW_MAX);
-                    }
+                    ui.horizontal(|ui| {
+                        let slider_width = (ui.available_width()
+                            - ui.spacing().interact_size.x
+                            - ui.spacing().item_spacing.x)
+                            .max(1.0);
+                        if ui
+                            .add_sized(
+                                [slider_width, ui.spacing().interact_size.y],
+                                egui::Slider::new(&mut glow_scale, 1..=STYLE_SCALE_MAX)
+                                    .text("Glow"),
+                            )
+                            .on_hover_text("Style scale: 1–10, where 10 is 100%.")
+                            .changed()
+                        {
+                            project.tracer.glow =
+                                style_scale_to_internal(glow_scale, TRACER_GLOW_MAX);
+                        }
+                        let mut color = Color32::from_rgb(
+                            project.tracer.glow_color[0],
+                            project.tracer.glow_color[1],
+                            project.tracer.glow_color[2],
+                        );
+                        if ui
+                            .color_edit_button_srgba(&mut color)
+                            .on_hover_text("Glow color")
+                            .changed()
+                        {
+                            project.tracer.glow_color = [color.r(), color.g(), color.b()];
+                        }
+                    });
                     let mut smoothing_scale =
                         internal_to_style_scale(project.path_smoothing, 1.0);
                     if ui
@@ -859,6 +952,26 @@ impl TracerApp {
                         project.path_smoothing =
                             style_scale_to_internal(smoothing_scale, 1.0);
                     }
+                    ui.add(
+                        egui::Slider::new(&mut project.trail_duration, 1.0..=10.0)
+                            .step_by(1.0)
+                            .text("Trail (seconds)"),
+                    )
+                    .on_hover_text(
+                        "How long each part of the tracer remains visible, from 1 to 10 seconds.",
+                    );
+                    let mut trail_pace_index = trail_pace_index(project.trail_pace);
+                    let trail_pace_label =
+                        format!("Trail pace ({:.2}x)", TRAIL_PACES[trail_pace_index as usize]);
+                    ui.add(
+                        egui::Slider::new(&mut trail_pace_index, 0..=2)
+                            .step_by(1.0)
+                            .text(trail_pace_label),
+                    )
+                    .on_hover_text(
+                        "After the selected trail duration, its old end moves forward at 0.25x, 0.5x, or 1.0x speed. Lower values erase the trail more slowly.",
+                    );
+                    project.trail_pace = TRAIL_PACES[trail_pace_index as usize];
                     ui.separator();
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -874,20 +987,25 @@ impl TracerApp {
                         }
                     });
                     ui.label(
-                        "Click the preview to add a keyframe. Drag the tracer point at the current frame to move it. Use WASD to nudge it by one preview pixel.",
+                        "Click the preview to add a keyframe. Drag the tracer point at the current frame to move it. Use WASD to nudge by 10 preview pixels, or 5 when zoomed past 400%; hold Shift for 1 pixel.",
                     );
                     let mut remove_index = None;
-                    for (index, keyframe) in project.keyframes.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(format!(
-                                "{:.3}s  ({:.2}, {:.2})",
-                                keyframe.time, keyframe.x, keyframe.y
-                            ));
-                            if ui.small_button("x").clicked() {
-                                remove_index = Some(index);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(ui.available_height())
+                        .show(ui, |ui| {
+                            for (index, keyframe) in project.keyframes.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!(
+                                        "{:.3}s  ({:.2}, {:.2})",
+                                        keyframe.time, keyframe.x, keyframe.y
+                                    ));
+                                    if ui.small_button("x").clicked() {
+                                        remove_index = Some(index);
+                                    }
+                                });
                             }
                         });
-                    }
                     if let Some(index) = remove_index {
                         project.keyframes.remove(index);
                     }
@@ -937,6 +1055,90 @@ impl TracerApp {
             self.request_preview();
         }
     }
+
+    fn handle_trace_keyboard(&mut self, ctx: &egui::Context) {
+        if self.screen != AppScreen::Trace || !self.canvas_zoom.keyboard_active {
+            return;
+        }
+
+        let (horizontal, vertical, fine_nudge, step_backward, step_forward) =
+            ctx.input_mut(|input| {
+                let modifiers = input.modifiers;
+                let horizontal = (if input.consume_key(modifiers, egui::Key::D) {
+                    1.0
+                } else {
+                    0.0
+                }) - (if input.consume_key(modifiers, egui::Key::A) {
+                    1.0
+                } else {
+                    0.0
+                });
+                let vertical = (if input.consume_key(modifiers, egui::Key::S) {
+                    1.0
+                } else {
+                    0.0
+                }) - (if input.consume_key(modifiers, egui::Key::W) {
+                    1.0
+                } else {
+                    0.0
+                });
+                let step_backward = input.consume_key(modifiers, egui::Key::ArrowLeft);
+                let step_forward = input.consume_key(modifiers, egui::Key::ArrowRight);
+                (
+                    horizontal,
+                    vertical,
+                    modifiers.shift,
+                    step_backward,
+                    step_forward,
+                )
+            });
+        if horizontal == 0.0 && vertical == 0.0 && !step_backward && !step_forward {
+            return;
+        }
+
+        let next_frame = self.project.as_mut().and_then(|project| {
+            let first_frame = time_to_frame(project.trim_in, project.frame_rate);
+            let last_frame =
+                time_to_frame(project.trim_out, project.frame_rate).min(last_frame(project));
+            let direction = if step_forward { 1 } else { -1 };
+            (step_backward || step_forward)
+                .then(|| {
+                    step_keyframe_frame(
+                        project,
+                        self.playhead_frame,
+                        direction,
+                        first_frame,
+                        last_frame,
+                    )
+                })
+                .flatten()
+        });
+        if let Some(next_frame) = next_frame {
+            if self.is_playing {
+                self.pause_playback();
+            }
+            self.playhead_frame = next_frame;
+            self.request_preview();
+        }
+
+        let nudge = Vec2::new(horizontal, vertical);
+        if nudge != Vec2::ZERO {
+            if let Some(project) = &mut self.project {
+                let time = frame_time(self.playhead_frame, project.frame_rate);
+                if let Some(index) =
+                    keyframe_index_at_time(&project.keyframes, time, project.frame_rate)
+                {
+                    let pixels = trace_nudge_pixels(self.canvas_zoom.scale, fine_nudge);
+                    let width = self.preview_size[0].max(1) as f32;
+                    let height = self.preview_size[1].max(1) as f32;
+                    project.keyframes[index].x =
+                        (project.keyframes[index].x + nudge.x * pixels / width).clamp(0.0, 1.0);
+                    project.keyframes[index].y =
+                        (project.keyframes[index].y + nudge.y * pixels / height).clamp(0.0, 1.0);
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for TracerApp {
@@ -982,6 +1184,8 @@ impl eframe::App for TracerApp {
                 Err(error) => self.status = error,
             }
         }
+
+        self.handle_trace_keyboard(ctx);
 
         let mut finished_motion = None;
         if let Some(receiver) = &self.motion_receiver {
@@ -1040,7 +1244,7 @@ impl eframe::App for TracerApp {
             }
         }
 
-        if !ctx.wants_keyboard_input()
+        if (self.canvas_zoom.keyboard_active || !ctx.wants_keyboard_input())
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Space))
         {
             self.toggle_playback();
@@ -1189,6 +1393,23 @@ fn draw_video_editor(
                 .interact_pointer_pos()
                 .is_some_and(|pointer| zoom_controls_rect.contains(pointer));
         if !trim_mode {
+            let pointer_clicked_outside_canvas = ui.input(|input| {
+                input.pointer.any_click()
+                    && input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|pointer| !video_area.contains(pointer))
+            });
+            if pointer_clicked_outside_canvas {
+                zoom.keyboard_active = false;
+            } else if canvas_response.clicked()
+                || canvas_response.drag_started_by(egui::PointerButton::Primary)
+                || canvas_response.drag_started_by(egui::PointerButton::Secondary)
+            {
+                zoom.keyboard_active = true;
+            }
+        }
+        if !trim_mode {
             let panning = canvas_response.dragged_by(egui::PointerButton::Secondary);
             if panning {
                 zoom.pan += canvas_response.drag_delta();
@@ -1274,67 +1495,6 @@ fn draw_video_editor(
         }
 
         if !trim_mode {
-            if !ui.ctx().wants_keyboard_input()
-                && !controls_hovered
-                && !canvas_response.dragged()
-                && canvas_response.has_focus()
-            {
-                let (horizontal, vertical, fine_nudge, step_backward, step_forward) =
-                    ui.input(|input| {
-                        (
-                            (if input.key_pressed(egui::Key::D) {
-                                1.0
-                            } else {
-                                0.0
-                            }) - (if input.key_pressed(egui::Key::A) {
-                                1.0
-                            } else {
-                                0.0
-                            }),
-                            (if input.key_pressed(egui::Key::S) {
-                                1.0
-                            } else {
-                                0.0
-                            }) - (if input.key_pressed(egui::Key::W) {
-                                1.0
-                            } else {
-                                0.0
-                            }),
-                            input.modifiers.shift,
-                            input.key_pressed(egui::Key::ArrowLeft),
-                            input.key_pressed(egui::Key::ArrowRight),
-                        )
-                    });
-                if step_backward || step_forward {
-                    let direction = if step_forward { 1 } else { -1 };
-                    if let Some(next_frame) = step_keyframe_frame(
-                        project,
-                        *playhead_frame,
-                        direction,
-                        first_frame,
-                        last_edit_frame,
-                    ) {
-                        *playhead_frame = next_frame;
-                        interaction.stop_playback = *is_playing;
-                        interaction.refresh_preview = true;
-                    }
-                }
-                let nudge = Vec2::new(horizontal, vertical);
-                if nudge != Vec2::ZERO {
-                    let time = frame_time(*playhead_frame, project.frame_rate);
-                    if let Some(index) =
-                        keyframe_index_at_time(&project.keyframes, time, project.frame_rate)
-                    {
-                        let pixels = if fine_nudge { 1.0 } else { 10.0 };
-                        project.keyframes[index].x = (project.keyframes[index].x
-                            + nudge.x * pixels / image_rect.width())
-                        .clamp(0.0, 1.0);
-                        project.keyframes[index].y = (project.keyframes[index].y
-                            + nudge.y * pixels / image_rect.height())
-                        .clamp(0.0, 1.0);
-                    }
-                }
-            }
             draw_preview_tracer(
                 ui,
                 &painter,
@@ -1903,8 +2063,8 @@ fn step_keyframe_frame(
     Some(target_frame)
 }
 
-fn endpoint_marker_scale(zoom_scale: f32) -> f32 {
-    zoom_scale.max(1.0).sqrt().recip().clamp(0.35, 1.0)
+fn preview_tracer_zoom_scale(zoom_scale: f32) -> f32 {
+    zoom_scale.max(1.0).powf(-1.15).clamp(0.0, 1.0)
 }
 
 fn draw_preview_tracer(
@@ -1916,7 +2076,10 @@ fn draw_preview_tracer(
     zoom_scale: f32,
     glow_texture: &mut Option<egui::TextureHandle>,
 ) {
+    let zoom_compensation = preview_tracer_zoom_scale(zoom_scale);
     let (width, glow) = scaled_tracer_dimensions(&project.tracer, rect.height());
+    let width = width * zoom_compensation;
+    let glow = glow * zoom_compensation;
     let points = project_trail_points(project, time);
     let raster_scale = PREVIEW_MAX_DIMENSION as f32 / rect.width().max(rect.height()).max(1.0);
     let raster_width = (rect.width() * raster_scale).round().max(1.0) as u32;
@@ -1931,7 +2094,7 @@ fn draw_preview_tracer(
         &raster_points,
         width * raster_scale,
         glow * raster_scale,
-        project.tracer.color,
+        project.tracer.glow_color,
     );
     if let Some(glow_layer) = glow_layer {
         let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -1974,7 +2137,7 @@ fn draw_preview_tracer(
         draw_preview_segment(painter, segment[0], segment[1], width, color);
     }
     if let Some(point) = points.last() {
-        painter.circle_filled(*point, width * endpoint_marker_scale(zoom_scale), color);
+        painter.circle_filled(*point, width, color);
     }
 }
 
@@ -2529,7 +2692,13 @@ fn camera_motion_offset(project: &Project, time: f32) -> (f32, f32) {
 }
 
 fn project_trail_points(project: &Project, time: f32) -> Vec<(f32, f32)> {
-    let mut points = trail_points(&project.keyframes, time, project.path_smoothing);
+    let mut points = trail_points(
+        &project.keyframes,
+        time,
+        project.path_smoothing,
+        project.trail_duration,
+        project.trail_pace,
+    );
     let (offset_x, offset_y) = camera_motion_offset(project, time);
     for (x, y) in &mut points {
         *x += offset_x;
@@ -2690,7 +2859,14 @@ fn render_overlay_frames(
             .iter()
             .map(|(x, y)| (x * width as f32, y * height as f32))
             .collect();
-        draw_feathered_path(&mut image, &scaled, line_width, glow, rgb);
+        draw_feathered_path(
+            &mut image,
+            &scaled,
+            line_width,
+            glow,
+            rgb,
+            project.tracer.glow_color,
+        );
         if let Some((x, y)) = scaled.last().copied() {
             draw_filled_circle_mut(
                 &mut image,
@@ -2785,11 +2961,17 @@ fn draw_feathered_path(
     points: &[(f32, f32)],
     core_width: f32,
     glow: f32,
-    rgb: [u8; 3],
+    line_rgb: [u8; 3],
+    glow_rgb: [u8; 3],
 ) {
-    if let Some(glow_layer) =
-        render_glow_layer(image.width(), image.height(), points, core_width, glow, rgb)
-    {
+    if let Some(glow_layer) = render_glow_layer(
+        image.width(),
+        image.height(),
+        points,
+        core_width,
+        glow,
+        glow_rgb,
+    ) {
         image::imageops::overlay(image, &glow_layer, 0, 0);
     }
     for segment in points.windows(2) {
@@ -2798,12 +2980,18 @@ fn draw_feathered_path(
             segment[0],
             segment[1],
             core_width.ceil() as u32,
-            Rgba([rgb[0], rgb[1], rgb[2], 255]),
+            Rgba([line_rgb[0], line_rgb[1], line_rgb[2], 255]),
         );
     }
 }
 
-fn trail_points(keys: &[Keyframe], time: f32, smoothing: f32) -> Vec<(f32, f32)> {
+fn trail_points(
+    keys: &[Keyframe],
+    time: f32,
+    smoothing: f32,
+    trail_duration: f32,
+    trail_pace: f32,
+) -> Vec<(f32, f32)> {
     const CURVE_SAMPLES: usize = 16;
     let Some(first) = keys.first() else {
         return Vec::new();
@@ -2813,31 +3001,70 @@ fn trail_points(keys: &[Keyframe], time: f32, smoothing: f32) -> Vec<(f32, f32)>
     }
     let smoothed_keys = smooth_keyframes(keys, smoothing);
     let keys = smoothed_keys.as_slice();
-    let first = &keys[0];
-    let mut points = vec![(first.x, first.y)];
+    if keys.len() == 1 || time <= keys[0].time {
+        return vec![(keys[0].x, keys[0].y)];
+    }
+
+    let window_start = trail_cutoff_time(keys[0].time, time, trail_duration, trail_pace);
+    let mut points = Vec::new();
     for segment_index in 0..keys.len().saturating_sub(1) {
         let start = &keys[segment_index];
         let end = &keys[segment_index + 1];
-        let span = (end.time - start.time).max(f32::EPSILON);
-        let fraction = ((time - start.time) / span).clamp(0.0, 1.0);
-        if fraction <= 0.0 {
-            break;
+        if end.time <= window_start {
+            continue;
         }
+        let span = (end.time - start.time).max(f32::EPSILON);
+        let start_fraction = ((window_start - start.time) / span).clamp(0.0, 1.0);
+        let end_fraction = ((time - start.time) / span).clamp(0.0, 1.0);
         let p0 = &keys[segment_index.saturating_sub(1)];
         let p3 = &keys[(segment_index + 2).min(keys.len() - 1)];
+        if end_fraction < start_fraction {
+            break;
+        }
+        if points.is_empty() {
+            points.push(catmull_rom_point(p0, start, end, p3, start_fraction));
+        }
         for sample in 1..=CURVE_SAMPLES {
             let sample_fraction = sample as f32 / CURVE_SAMPLES as f32;
-            if sample_fraction >= fraction {
+            if sample_fraction <= start_fraction {
+                continue;
+            }
+            if sample_fraction >= end_fraction {
                 break;
             }
             points.push(catmull_rom_point(p0, start, end, p3, sample_fraction));
         }
-        points.push(catmull_rom_point(p0, start, end, p3, fraction));
-        if fraction < 1.0 {
+        if end_fraction > start_fraction {
+            points.push(catmull_rom_point(p0, start, end, p3, end_fraction));
+        }
+        if end_fraction < 1.0 {
             break;
         }
     }
+    if points.is_empty() {
+        let (x, y) = position_on_path(keys, time);
+        points.push((x, y));
+    }
     points
+}
+
+fn position_on_path(keys: &[Keyframe], time: f32) -> (f32, f32) {
+    if time <= keys[0].time {
+        return (keys[0].x, keys[0].y);
+    }
+    for segment_index in 0..keys.len().saturating_sub(1) {
+        let start = &keys[segment_index];
+        let end = &keys[segment_index + 1];
+        if time <= end.time {
+            let span = (end.time - start.time).max(f32::EPSILON);
+            let fraction = ((time - start.time) / span).clamp(0.0, 1.0);
+            let p0 = &keys[segment_index.saturating_sub(1)];
+            let p3 = &keys[(segment_index + 2).min(keys.len() - 1)];
+            return catmull_rom_point(p0, start, end, p3, fraction);
+        }
+    }
+    let last = keys.last().expect("non-empty keyframes");
+    (last.x, last.y)
 }
 
 fn smooth_keyframes(keys: &[Keyframe], amount: f32) -> Vec<Keyframe> {
@@ -3023,14 +3250,15 @@ fn apply_app_theme(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::{
-        camera_motion_offset, draw_feathered_path, endpoint_marker_scale,
+        camera_motion_offset, default_trail_duration, default_trail_pace, draw_feathered_path,
         estimate_frame_translation, expected_motion_analysis_samples, frame_time,
-        internal_to_style_scale, keyframe_index_at_time, playback_frame_deadline,
-        preview_stream_is_ready, project_trail_points, read_mjpeg_frame, scaled_tracer_dimensions,
-        smooth_keyframes, snap_trim_time, step_keyframe_frame, style_scale_to_internal,
-        time_to_frame, timeline_range, trail_points, zoom_pan_for_cursor, zoomed_preview_rect,
-        CameraMotionSample, Keyframe, Project, TracerStyle, MAX_CANVAS_ZOOM, TRACER_GLOW_MAX,
-        TRACER_WIDTH_MAX,
+        internal_to_style_scale, keyframe_index_at_time, playback_frame_deadline, position_on_path,
+        preview_stream_is_ready, preview_tracer_zoom_scale, project_trail_points, read_mjpeg_frame,
+        scaled_tracer_dimensions, smooth_keyframes, snap_trim_time, step_keyframe_frame,
+        style_scale_to_internal, time_to_frame, timeline_range, trace_nudge_pixels,
+        trail_cutoff_time, trail_pace_index, trail_points, zoom_pan_for_cursor,
+        zoomed_preview_rect, CameraMotionSample, Keyframe, Project, TracerStyle, MAX_CANVAS_ZOOM,
+        TRACER_GLOW_MAX, TRACER_WIDTH_MAX,
     };
     use eframe::egui::{Pos2, Rect, Vec2};
     use image::{Rgba, RgbaImage};
@@ -3054,6 +3282,36 @@ mod tests {
         assert_eq!(internal_to_style_scale(5.0, TRACER_WIDTH_MAX), 3);
         assert_eq!(internal_to_style_scale(10.0, TRACER_GLOW_MAX), 4);
         assert_eq!(internal_to_style_scale(0.5, 1.0), 5);
+    }
+
+    #[test]
+    fn tracer_and_glow_colors_default_to_the_same_red() {
+        let style = TracerStyle::default();
+        assert_eq!(style.color, [255, 76, 48]);
+        assert_eq!(style.glow_color, style.color);
+    }
+
+    #[test]
+    fn wasd_nudge_step_changes_after_four_x_zoom_and_shift_stays_fine() {
+        assert_eq!(trace_nudge_pixels(1.0, false), 10.0);
+        assert_eq!(trace_nudge_pixels(4.0, false), 10.0);
+        assert_eq!(trace_nudge_pixels(4.01, false), 5.0);
+        assert_eq!(trace_nudge_pixels(8.0, false), 5.0);
+        assert_eq!(trace_nudge_pixels(8.0, true), 1.0);
+    }
+
+    #[test]
+    fn trail_pace_controls_how_long_the_configured_trail_remains_visible() {
+        assert_eq!(trail_pace_index(0.25), 0);
+        assert_eq!(trail_pace_index(0.5), 1);
+        assert_eq!(trail_pace_index(1.0), 2);
+        assert_eq!(trail_cutoff_time(0.0, 5.0, 5.0, 0.25), 0.0);
+        assert_eq!(trail_cutoff_time(0.0, 5.0, 5.0, 0.5), 0.0);
+        assert_eq!(trail_cutoff_time(0.0, 5.0, 5.0, 1.0), 0.0);
+        assert_eq!(trail_cutoff_time(0.0, 9.0, 5.0, 0.25), 1.0);
+        assert_eq!(trail_cutoff_time(0.0, 9.0, 5.0, 0.5), 2.0);
+        assert_eq!(trail_cutoff_time(0.0, 9.0, 5.0, 1.0), 4.0);
+        assert_eq!(default_trail_pace(), 0.5);
     }
 
     #[test]
@@ -3115,11 +3373,13 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_marker_scales_down_gently_as_canvas_zoom_increases() {
-        assert_eq!(endpoint_marker_scale(1.0), 1.0);
-        assert_eq!(endpoint_marker_scale(4.0), 0.5);
-        assert!(endpoint_marker_scale(8.0) > 0.35);
-        assert!(endpoint_marker_scale(8.0) < endpoint_marker_scale(4.0));
+    fn preview_tracer_thickness_and_glow_shrink_gently_with_zoom() {
+        assert_eq!(preview_tracer_zoom_scale(1.0), 1.0);
+        let four_x_size = 4.0 * preview_tracer_zoom_scale(4.0);
+        let eight_x_size = 8.0 * preview_tracer_zoom_scale(8.0);
+        assert!(four_x_size < 1.0);
+        assert!(eight_x_size < four_x_size);
+        assert!(eight_x_size > 0.7);
     }
 
     #[test]
@@ -3129,7 +3389,7 @@ mod tests {
             x: 0.2,
             y: 0.4,
         }];
-        assert!(trail_points(&keys, 0.5, 0.0).is_empty());
+        assert!(trail_points(&keys, 0.5, 0.0, 5.0, 1.0).is_empty());
     }
 
     #[test]
@@ -3146,7 +3406,7 @@ mod tests {
                 y: 0.6,
             },
         ];
-        let points = trail_points(&keys, 1.0, 0.0);
+        let points = trail_points(&keys, 1.0, 0.0, 5.0, 1.0);
         let (x, y) = points.last().copied().expect("interpolated point");
         assert!((x - 0.5).abs() < 0.0001);
         assert!((y - 0.5).abs() < 0.0001);
@@ -3176,11 +3436,103 @@ mod tests {
                 y: 0.0,
             },
         ];
-        let points = trail_points(&keys, 1.5, 0.0);
+        let points = trail_points(&keys, 1.5, 0.0, 5.0, 1.0);
         assert!(points.iter().any(|(_, y)| *y > 0.5));
         let (x, y) = points.last().copied().expect("interpolated point");
         assert!((x - 0.5).abs() < 0.0001);
         assert!((y - 0.5625).abs() < 0.0001);
+    }
+
+    #[test]
+    fn trail_duration_clips_the_oldest_path_at_the_exact_time_cutoff() {
+        let keys = [
+            Keyframe {
+                time: 0.0,
+                x: 0.1,
+                y: 0.2,
+            },
+            Keyframe {
+                time: 1.0,
+                x: 0.4,
+                y: 0.6,
+            },
+            Keyframe {
+                time: 2.0,
+                x: 0.9,
+                y: 0.8,
+            },
+        ];
+        let points = trail_points(&keys, 2.0, 0.0, 1.0, 1.0);
+        assert_eq!(points.first().copied(), Some((0.4, 0.6)));
+        let last = points.last().copied().expect("current tracer point");
+        assert!((last.0 - 0.9).abs() < 0.0001);
+        assert!((last.1 - 0.8).abs() < 0.0001);
+        assert!(points.iter().all(|(x, _)| *x >= 0.4));
+    }
+
+    #[test]
+    fn trail_duration_cutoff_interpolates_between_keyframes() {
+        let keys = [
+            Keyframe {
+                time: 0.0,
+                x: 0.1,
+                y: 0.2,
+            },
+            Keyframe {
+                time: 2.0,
+                x: 0.9,
+                y: 0.8,
+            },
+        ];
+        let points = trail_points(&keys, 2.0, 0.0, 1.0, 1.0);
+        let expected = position_on_path(&keys, 1.0);
+        assert!((points[0].0 - expected.0).abs() < 0.0001);
+        assert!((points[0].1 - expected.1).abs() < 0.0001);
+        let last = points.last().copied().expect("current tracer point");
+        assert!((last.0 - 0.9).abs() < 0.0001);
+        assert!((last.1 - 0.8).abs() < 0.0001);
+    }
+
+    #[test]
+    fn project_trail_pace_changes_the_cutoff_speed_after_the_duration() {
+        let mut project = Project {
+            video_path: PathBuf::new(),
+            duration: 3.0,
+            frame_rate: 30.0,
+            trim_in: 0.0,
+            trim_out: 3.0,
+            keyframes: vec![
+                Keyframe {
+                    time: 0.0,
+                    x: 0.1,
+                    y: 0.2,
+                },
+                Keyframe {
+                    time: 2.0,
+                    x: 0.9,
+                    y: 0.8,
+                },
+            ],
+            camera_motion: Vec::new(),
+            camera_motion_enabled: false,
+            path_smoothing: 0.0,
+            trail_duration: 1.0,
+            trail_pace: 0.5,
+            tracer: TracerStyle::default(),
+        };
+        let half_speed_points = project_trail_points(&project, 2.0);
+        let half_speed_cutoff = half_speed_points.first().copied().expect("trail cutoff");
+        let expected_half_speed = position_on_path(&project.keyframes, 0.5);
+        assert!((half_speed_cutoff.0 - expected_half_speed.0).abs() < 0.0001);
+        assert!((half_speed_cutoff.1 - expected_half_speed.1).abs() < 0.0001);
+
+        project.trail_pace = 1.0;
+        let full_speed_points = project_trail_points(&project, 2.0);
+        let full_speed_cutoff = full_speed_points.first().copied().expect("trail cutoff");
+        let expected_full_speed = position_on_path(&project.keyframes, 1.0);
+        assert!((full_speed_cutoff.0 - expected_full_speed.0).abs() < 0.0001);
+        assert!((full_speed_cutoff.1 - expected_full_speed.1).abs() < 0.0001);
+        assert!(half_speed_cutoff.0 < full_speed_cutoff.0);
     }
 
     #[test]
@@ -3237,6 +3589,8 @@ mod tests {
             ],
             camera_motion_enabled: true,
             path_smoothing: 0.5,
+            trail_duration: 5.0,
+            trail_pace: 0.5,
             tracer: TracerStyle::default(),
         };
         let points = project_trail_points(&project, 0.5);
@@ -3283,6 +3637,8 @@ mod tests {
             camera_motion: Vec::new(),
             camera_motion_enabled: false,
             path_smoothing: 0.5,
+            trail_duration: 5.0,
+            trail_pace: 0.5,
             tracer: TracerStyle::default(),
         };
         assert_eq!(step_keyframe_frame(&mut project, 30, 1, 0, 89), Some(31));
@@ -3308,6 +3664,8 @@ mod tests {
             camera_motion: Vec::new(),
             camera_motion_enabled: false,
             path_smoothing: 0.5,
+            trail_duration: 5.0,
+            trail_pace: 0.5,
             tracer: TracerStyle::default(),
         };
         assert_eq!(step_keyframe_frame(&mut project, 30, 1, 0, 89), Some(31));
@@ -3333,6 +3691,9 @@ mod tests {
         .expect("legacy project should remain loadable");
         assert!(!project.camera_motion_enabled);
         assert!(project.camera_motion.is_empty());
+        assert_eq!(project.trail_duration, default_trail_duration());
+        assert_eq!(project.trail_pace, default_trail_pace());
+        assert_eq!(project.tracer.glow_color, project.tracer.color);
     }
 
     #[test]
@@ -3435,6 +3796,7 @@ mod tests {
             4.0,
             6.0,
             [40, 220, 80],
+            [40, 220, 80],
         );
         assert_eq!(image.get_pixel(50, 20).0[3], 255);
         let edge_alpha: Vec<u8> = (24..=35).map(|y| image.get_pixel(50, y).0[3]).collect();
@@ -3454,8 +3816,29 @@ mod tests {
             4.0,
             8.0,
             [40, 220, 80],
+            [40, 220, 80],
         );
         assert_eq!(image.get_pixel(30, 20), &Rgba([40, 220, 80, 255]));
+    }
+
+    #[test]
+    fn glow_can_use_a_different_color_from_the_tracer_core() {
+        let line_color = [40, 220, 80];
+        let glow_color = [240, 20, 20];
+        let mut image = RgbaImage::new(100, 40);
+        draw_feathered_path(
+            &mut image,
+            &[(5.0, 20.0), (95.0, 20.0)],
+            4.0,
+            6.0,
+            line_color,
+            glow_color,
+        );
+        assert_eq!(image.get_pixel(50, 20), &Rgba([40, 220, 80, 255]));
+        assert!((0..40).any(|y| {
+            let pixel = image.get_pixel(50, y);
+            pixel.0[0] == glow_color[0] && pixel.0[1] == glow_color[1] && pixel.0[3] > 0
+        }));
     }
 
     #[test]
