@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 const EXPORT_FPS: u32 = 30;
 const FRAME_LIMIT: u32 = 60 * 60 * 30;
 const PREVIEW_MAX_DIMENSION: u32 = 720;
-const PREVIEW_FRAME_MAX_DIMENSION: u32 = 1920;
+const PREVIEW_FRAME_MAX_DIMENSION: u32 = 1280;
+const PLAYBACK_BUFFER_SECONDS: f32 = 0.5;
 const PREVIEW_CACHE_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 // How far ahead of the background decoder a requested frame may be before the decoder restarts there.
 const PREVIEW_FILL_LOOKAHEAD_FRAMES: u64 = 45;
@@ -2383,6 +2384,7 @@ struct PreviewWorker {
     last_restart: Option<u64>,
     foreground: Foreground,
     decoded: HashMap<u64, Receiver<Result<PreviewFrame, String>>>,
+    buffering: bool,
 }
 
 impl PreviewWorker {
@@ -2397,6 +2399,7 @@ impl PreviewWorker {
             last_restart: None,
             foreground: Foreground::Idle,
             decoded: HashMap::new(),
+            buffering: false,
         }
     }
 
@@ -2432,6 +2435,7 @@ impl PreviewWorker {
             }
             PreviewCommand::Play(request) => {
                 let frame = self.begin_request(&request);
+                self.buffering = true;
                 self.foreground = Foreground::Play {
                     id: request.id,
                     frame,
@@ -2617,6 +2621,32 @@ impl PreviewWorker {
                 }
                 lock_cache(&self.cache).focus = frame;
                 self.start_decode_ahead(frame);
+                if self.buffering {
+                    let needed = ((frame_rate * PLAYBACK_BUFFER_SECONDS).ceil() as u64)
+                        .min(self.frame_range.1 - frame + 1);
+                    if lock_cache(&self.cache).cached_run(frame, needed) < needed {
+                        return match self.ensure_frame_fill(frame) {
+                            Ok(()) => None,
+                            Err(_) => {
+                                self.foreground = Foreground::Idle;
+                                Some(ForegroundMessage::Reliable(PreviewResult {
+                                    id,
+                                    time: frame_time(frame, frame_rate),
+                                    result: Ok(PreviewFrame::default()),
+                                    finished: true,
+                                }))
+                            }
+                        };
+                    }
+                    self.buffering = false;
+                    self.foreground = Foreground::Play {
+                        id,
+                        frame,
+                        clock_start: Instant::now(),
+                        clock_frame: frame,
+                    };
+                    return None;
+                }
                 let deadline =
                     playback_frame_deadline(clock_start, frame - clock_frame, frame_rate);
                 if Instant::now() < deadline {
@@ -2636,13 +2666,8 @@ impl PreviewWorker {
                         finished: false,
                     }));
                 }
-                // Decoding is behind playback: hold the clock until the frame arrives.
-                self.foreground = Foreground::Play {
-                    id,
-                    frame,
-                    clock_start: Instant::now(),
-                    clock_frame: frame,
-                };
+                // Decoding is behind playback: pause and rebuffer instead of stuttering.
+                self.buffering = true;
                 match self.ensure_frame_fill(frame) {
                     Ok(()) => None,
                     Err(_) => {
@@ -2722,6 +2747,12 @@ impl FrameCache {
         true
     }
 
+    fn cached_run(&self, start: u64, limit: u64) -> u64 {
+        (0..limit)
+            .take_while(|offset| self.frames.contains_key(&(start + offset)))
+            .count() as u64
+    }
+
     // Shrinks start..=end past already cached frames at both ends.
     fn uncached_span(&self, mut start: u64, mut end: u64) -> Option<(u64, u64)> {
         while start <= end && self.frames.contains_key(&start) {
@@ -2767,7 +2798,7 @@ impl FrameFiller {
             ))
             .arg("-frames:v")
             .arg((end - start + 1).to_string())
-            .args(["-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"])
+            .args(["-q:v", "7", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
