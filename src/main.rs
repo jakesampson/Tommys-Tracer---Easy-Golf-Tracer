@@ -600,62 +600,81 @@ impl TracerApp {
     }
 
     fn show_welcome(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let ambient = ui.max_rect();
-            ui.painter().circle_filled(
-                ambient.center() + Vec2::new(-180.0, -90.0),
-                250.0,
-                Color32::from_rgba_unmultiplied(47, 119, 213, 35),
-            );
-            ui.painter().circle_filled(
-                ambient.center() + Vec2::new(240.0, 140.0),
-                220.0,
-                Color32::from_rgba_unmultiplied(55, 191, 174, 22),
-            );
-            ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() * 0.13);
-                egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(28, 43, 60, 228))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(38)))
-                    .corner_radius(egui::CornerRadius::same(24))
-                    .inner_margin(egui::Margin::same(32))
-                    .show(ui, |ui| {
-                        ui.set_max_width(520.0);
-                        ui.vertical_centered(|ui| {
-                            ui.add(
-                                egui::Image::new((self.welcome_logo.id(), Vec2::new(420.0, 280.0)))
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(Color32::from_rgb(19, 29, 41)))
+            .show(ctx, |ui| {
+                let ambient = ui.max_rect();
+                ui.painter().circle_filled(
+                    ambient.center() + Vec2::new(-180.0, -90.0),
+                    250.0,
+                    Color32::from_rgba_unmultiplied(47, 119, 213, 35),
+                );
+                ui.painter().circle_filled(
+                    ambient.center() + Vec2::new(240.0, 140.0),
+                    220.0,
+                    Color32::from_rgba_unmultiplied(55, 191, 174, 22),
+                );
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.13);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(28, 43, 60, 228))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(38)))
+                        .corner_radius(egui::CornerRadius::same(24))
+                        .inner_margin(egui::Margin::same(32))
+                        .show(ui, |ui| {
+                            ui.set_max_width(520.0);
+                            ui.vertical_centered(|ui| {
+                                ui.add(
+                                    egui::Image::new((
+                                        self.welcome_logo.id(),
+                                        Vec2::new(420.0, 280.0),
+                                    ))
                                     .fit_to_exact_size(Vec2::new(420.0, 280.0)),
+                                );
+                                ui.add_space(8.0);
+                                ui.label(
+                                egui::RichText::new(
+                                    "Trace the ball flight in your golf videos, frame by frame.",
+                                )
+                                .color(Color32::from_rgb(218, 229, 241)),
                             );
-                            ui.add_space(8.0);
-                            ui.label("Trace the ball flight in your golf videos, frame by frame.");
-                            ui.add_space(24.0);
-                            if ui
-                                .add_sized(
-                                    [300.0, 42.0],
-                                    egui::Button::new(
-                                        egui::RichText::new("Select a video").strong(),
+                                ui.add_space(6.0);
+                                ui.label(
+                                egui::RichText::new(
+                                    "Requires FFmpeg and FFprobe installed and available on PATH.",
+                                )
+                                .color(Color32::from_rgb(176, 195, 214))
+                                .small(),
+                            );
+                                ui.add_space(24.0);
+                                if ui
+                                    .add_sized(
+                                        [300.0, 42.0],
+                                        egui::Button::new(
+                                            egui::RichText::new("Select a video").strong(),
+                                        )
+                                        .fill(Color32::from_rgb(43, 132, 255)),
                                     )
-                                    .fill(Color32::from_rgb(43, 132, 255)),
-                                )
-                                .clicked()
-                            {
-                                self.open_video();
-                            }
-                            ui.add_space(8.0);
-                            if ui
-                                .add_sized(
-                                    [300.0, 38.0],
-                                    egui::Button::new("Open a saved project")
-                                        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
-                                )
-                                .clicked()
-                            {
-                                self.load_project();
-                            }
+                                    .clicked()
+                                {
+                                    self.open_video();
+                                }
+                                ui.add_space(8.0);
+                                if ui
+                                    .add_sized(
+                                        [300.0, 38.0],
+                                        egui::Button::new("Open a saved project").fill(
+                                            Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    self.load_project();
+                                }
+                            });
                         });
-                    });
+                });
             });
-        });
     }
 
     fn show_trim_screen(&mut self, ctx: &egui::Context) {
@@ -1295,22 +1314,24 @@ impl eframe::App for TracerApp {
             self.export_phase.clear();
         }
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(&self.status);
-                if self.export_receiver.is_some() {
-                    ui.add(
-                        egui::ProgressBar::new(self.export_progress)
-                            .desired_width(200.0)
-                            .text(format!(
-                                "{}: {:.0}%",
-                                self.export_phase,
-                                self.export_progress * 100.0
-                            )),
-                    );
-                }
+        egui::TopBottomPanel::bottom("status")
+            .frame(egui::Frame::new().fill(Color32::from_rgb(19, 29, 41)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(&self.status);
+                    if self.export_receiver.is_some() {
+                        ui.add(
+                            egui::ProgressBar::new(self.export_progress)
+                                .desired_width(200.0)
+                                .text(format!(
+                                    "{}: {:.0}%",
+                                    self.export_phase,
+                                    self.export_progress * 100.0
+                                )),
+                        );
+                    }
+                });
             });
-        });
 
         match self.screen {
             AppScreen::Welcome => self.show_welcome(ctx),
@@ -2172,31 +2193,62 @@ fn probe_video_info(path: &Path) -> Result<(f32, f32), String> {
 }
 
 fn probe_frame_rate(path: &Path) -> Result<f32, String> {
-    for entry in ["avg_frame_rate", "r_frame_rate"] {
-        let output = Command::new("ffprobe")
-            .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
-            .arg(format!("stream={entry}"))
-            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
-            .arg(path)
-            .output()
-            .map_err(|error| format!("Could not start ffprobe: {error}"))?;
-        if !output.status.success() {
-            continue;
-        }
-        if let Some(frame_rate) = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .split_once('/')
-            .and_then(|(numerator, denominator)| {
-                let numerator = numerator.parse::<f32>().ok()?;
-                let denominator = denominator.parse::<f32>().ok()?;
-                let frame_rate = numerator / denominator;
-                (frame_rate.is_finite() && frame_rate > 0.0).then_some(frame_rate)
-            })
-        {
-            return Ok(frame_rate);
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate,r_frame_rate",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| {
+            format!(
+                "Could not start ffprobe. Install FFmpeg, add its bin folder to PATH, and restart Tommy's Tracer: {error}"
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe could not read the video's frame rate: {}. Install FFmpeg and ensure ffprobe is available on PATH.",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    for (name, value) in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('='))
+    {
+        if matches!(name, "avg_frame_rate" | "r_frame_rate") {
+            if let Some(frame_rate) = parse_frame_rate(value) {
+                return Ok(frame_rate);
+            }
         }
     }
-    Err("Could not determine a valid video frame rate with ffprobe.".to_owned())
+    let details = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Err(format!(
+        "Could not determine a valid video frame rate with ffprobe. It reported: {}. Check that the selected file contains a video stream and that FFmpeg is installed.",
+        if details.is_empty() {
+            "no frame-rate values".to_owned()
+        } else {
+            details
+        }
+    ))
+}
+
+fn parse_frame_rate(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let frame_rate = if let Some((numerator, denominator)) = value.split_once('/') {
+        let numerator = numerator.parse::<f32>().ok()?;
+        let denominator = denominator.parse::<f32>().ok()?;
+        numerator / denominator
+    } else {
+        value.parse::<f32>().ok()?
+    };
+    (frame_rate.is_finite() && frame_rate > 0.0).then_some(frame_rate)
 }
 
 fn probe_duration(path: &Path) -> Result<f32, String> {
@@ -3269,11 +3321,11 @@ mod tests {
     use super::{
         camera_motion_offset, default_trail_duration, default_trail_pace, draw_feathered_path,
         estimate_frame_translation, expected_motion_analysis_samples, frame_time,
-        internal_to_style_scale, keyframe_index_at_time, playback_frame_deadline, position_on_path,
-        preview_stream_is_ready, preview_tracer_zoom_scale, project_trail_points, read_mjpeg_frame,
-        scaled_tracer_dimensions, smooth_keyframes, snap_trim_time, step_keyframe_frame,
-        style_scale_to_internal, time_to_frame, timeline_range, trace_nudge_pixels,
-        trail_cutoff_time, trail_pace_index, trail_points, zoom_pan_for_cursor,
+        internal_to_style_scale, keyframe_index_at_time, parse_frame_rate, playback_frame_deadline,
+        position_on_path, preview_stream_is_ready, preview_tracer_zoom_scale, project_trail_points,
+        read_mjpeg_frame, scaled_tracer_dimensions, smooth_keyframes, snap_trim_time,
+        step_keyframe_frame, style_scale_to_internal, time_to_frame, timeline_range,
+        trace_nudge_pixels, trail_cutoff_time, trail_pace_index, trail_points, zoom_pan_for_cursor,
         zoomed_preview_rect, CameraMotionSample, Keyframe, Project, TracerStyle, MAX_CANVAS_ZOOM,
         TRACER_GLOW_MAX, TRACER_WIDTH_MAX,
     };
@@ -3282,6 +3334,14 @@ mod tests {
     use std::io::Cursor;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn frame_rate_parser_accepts_fractional_and_decimal_values() {
+        assert_eq!(parse_frame_rate("30000/1001"), Some(30000.0 / 1001.0));
+        assert_eq!(parse_frame_rate("29.97"), Some(29.97));
+        assert_eq!(parse_frame_rate("0/0"), None);
+        assert_eq!(parse_frame_rate("N/A"), None);
+    }
 
     #[test]
     fn tracer_style_controls_map_whole_number_scale_to_internal_values() {
