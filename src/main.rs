@@ -1012,7 +1012,7 @@ impl TracerApp {
                         }
                     });
                     ui.label(
-                        "Click the preview to add a keyframe. Drag the tracer point at the current frame to move it. Use WASD to nudge by 10 preview pixels, or 5 when zoomed past 400%; hold Shift for 1 pixel.",
+                        "Click the preview to add a keyframe. Arrow keys browse frames without adding points; WASD nudges the tracer where it currently appears, creating a keyframe only when needed. Nudges are 10 preview pixels, 5 when zoomed past 400%, or 1 with Shift.",
                     );
                     let mut remove_index = None;
                     egui::ScrollArea::vertical()
@@ -1082,31 +1082,34 @@ impl TracerApp {
     }
 
     fn handle_trace_keyboard(&mut self, ctx: &egui::Context) {
-        if self.screen != AppScreen::Trace || !self.canvas_zoom.keyboard_active {
+        if self.screen != AppScreen::Trace {
             return;
         }
 
+        let keyboard_editing_active = self.canvas_zoom.keyboard_active;
         let (horizontal, vertical, fine_nudge, step_backward, step_forward) =
             ctx.input_mut(|input| {
                 let modifiers = input.modifiers;
-                let horizontal = (if input.consume_key(modifiers, egui::Key::D) {
-                    1.0
-                } else {
-                    0.0
-                }) - (if input.consume_key(modifiers, egui::Key::A) {
-                    1.0
-                } else {
-                    0.0
-                });
-                let vertical = (if input.consume_key(modifiers, egui::Key::S) {
-                    1.0
-                } else {
-                    0.0
-                }) - (if input.consume_key(modifiers, egui::Key::W) {
-                    1.0
-                } else {
-                    0.0
-                });
+                let horizontal =
+                    (if keyboard_editing_active && input.consume_key(modifiers, egui::Key::D) {
+                        1.0
+                    } else {
+                        0.0
+                    }) - (if keyboard_editing_active && input.consume_key(modifiers, egui::Key::A) {
+                        1.0
+                    } else {
+                        0.0
+                    });
+                let vertical =
+                    (if keyboard_editing_active && input.consume_key(modifiers, egui::Key::S) {
+                        1.0
+                    } else {
+                        0.0
+                    }) - (if keyboard_editing_active && input.consume_key(modifiers, egui::Key::W) {
+                        1.0
+                    } else {
+                        0.0
+                    });
                 let step_backward = input.consume_key(modifiers, egui::Key::ArrowLeft);
                 let step_forward = input.consume_key(modifiers, egui::Key::ArrowRight);
                 (
@@ -1127,15 +1130,7 @@ impl TracerApp {
                 time_to_frame(project.trim_out, project.frame_rate).min(last_frame(project));
             let direction = if step_forward { 1 } else { -1 };
             (step_backward || step_forward)
-                .then(|| {
-                    step_keyframe_frame(
-                        project,
-                        self.playhead_frame,
-                        direction,
-                        first_frame,
-                        last_frame,
-                    )
-                })
+                .then(|| step_frame(self.playhead_frame, direction, first_frame, last_frame))
                 .flatten()
         });
         if let Some(next_frame) = next_frame {
@@ -1150,17 +1145,16 @@ impl TracerApp {
         if nudge != Vec2::ZERO {
             if let Some(project) = &mut self.project {
                 let time = frame_time(self.playhead_frame, project.frame_rate);
-                if let Some(index) =
-                    keyframe_index_at_time(&project.keyframes, time, project.frame_rate)
-                {
-                    let pixels = trace_nudge_pixels(self.canvas_zoom.scale, fine_nudge);
-                    let width = self.preview_size[0].max(1) as f32;
-                    let height = self.preview_size[1].max(1) as f32;
-                    project.keyframes[index].x =
-                        (project.keyframes[index].x + nudge.x * pixels / width).clamp(0.0, 1.0);
-                    project.keyframes[index].y =
-                        (project.keyframes[index].y + nudge.y * pixels / height).clamp(0.0, 1.0);
-                }
+                let Some(index) = ensure_keyframe_at_time(project, time) else {
+                    return;
+                };
+                let pixels = trace_nudge_pixels(self.canvas_zoom.scale, fine_nudge);
+                let width = self.preview_size[0].max(1) as f32;
+                let height = self.preview_size[1].max(1) as f32;
+                project.keyframes[index].x =
+                    (project.keyframes[index].x + nudge.x * pixels / width).clamp(0.0, 1.0);
+                project.keyframes[index].y =
+                    (project.keyframes[index].y + nudge.y * pixels / height).clamp(0.0, 1.0);
             }
         }
     }
@@ -2061,33 +2055,27 @@ fn keyframe_index_at_time(keyframes: &[Keyframe], time: f32, frame_rate: f32) ->
         .map(|(index, _)| index)
 }
 
-fn step_keyframe_frame(
-    project: &mut Project,
-    current_frame: u64,
-    direction: i8,
-    first_frame: u64,
-    last_frame: u64,
-) -> Option<u64> {
+fn step_frame(current_frame: u64, direction: i8, first_frame: u64, last_frame: u64) -> Option<u64> {
     let target_frame = match direction.cmp(&0) {
         std::cmp::Ordering::Less => current_frame.checked_sub(1)?.max(first_frame),
         std::cmp::Ordering::Greater => current_frame.saturating_add(1).min(last_frame),
         std::cmp::Ordering::Equal => return None,
     };
-    if target_frame == current_frame {
-        return None;
+    (target_frame != current_frame).then_some(target_frame)
+}
+
+fn ensure_keyframe_at_time(project: &mut Project, time: f32) -> Option<usize> {
+    if let Some(index) = keyframe_index_at_time(&project.keyframes, time, project.frame_rate) {
+        return Some(index);
     }
 
-    let current_time = frame_time(current_frame, project.frame_rate);
-    let target_time = frame_time(target_frame, project.frame_rate);
-    let current_keyframe =
-        keyframe_index_at_time(&project.keyframes, current_time, project.frame_rate)
-            .map(|index| (project.keyframes[index].x, project.keyframes[index].y));
-    if keyframe_index_at_time(&project.keyframes, target_time, project.frame_rate).is_none() {
-        if let Some((x, y)) = current_keyframe {
-            add_keyframe(project, target_time, x, y);
-        }
+    if project.keyframes.is_empty() {
+        return None;
     }
-    Some(target_frame)
+    let smoothed_keys = smooth_keyframes(&project.keyframes, project.path_smoothing);
+    let (x, y) = position_on_path(&smoothed_keys, time);
+    add_keyframe(project, time, x, y);
+    keyframe_index_at_time(&project.keyframes, time, project.frame_rate)
 }
 
 fn preview_tracer_zoom_scale(zoom_scale: f32) -> f32 {
@@ -2877,20 +2865,36 @@ fn probe_video_dimension(path: &Path, dimension: &str) -> Result<u32, String> {
     let output = Command::new("ffprobe")
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
         .arg(format!("stream={dimension}"))
-        .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+        .args(["-of", "default=noprint_wrappers=1"])
         .arg(path)
         .output()
         .map_err(|error| format!("Could not start ffprobe: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "Could not read video {dimension}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "Could not read video {dimension}: {}. ffprobe output: {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
         ));
     }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()
-        .map_err(|error| format!("ffprobe returned an invalid video {dimension}: {error}"))
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_video_dimension(&stdout, dimension).ok_or_else(|| {
+        format!(
+            "ffprobe returned an invalid video {dimension}. Expected a positive integer; output was: {}",
+            stdout.trim()
+        )
+    })
+}
+
+fn parse_video_dimension(output: &str, dimension: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        let value = match line.split_once('=') {
+            Some((key, value)) if key.trim() == dimension => value.trim(),
+            Some(_) => return None,
+            None => line,
+        };
+        value.parse::<u32>().ok().filter(|dimension| *dimension > 0)
+    })
 }
 
 fn render_overlay_frames(
@@ -3321,12 +3325,13 @@ fn apply_app_theme(ctx: &egui::Context) {
 mod tests {
     use super::{
         camera_motion_offset, default_trail_duration, default_trail_pace, draw_feathered_path,
-        estimate_frame_translation, expected_motion_analysis_samples, frame_time,
-        internal_to_style_scale, keyframe_index_at_time, parse_frame_rate, playback_frame_deadline,
-        position_on_path, preview_stream_is_ready, preview_tracer_zoom_scale, project_trail_points,
-        read_mjpeg_frame, scaled_tracer_dimensions, smooth_keyframes, snap_trim_time,
-        step_keyframe_frame, style_scale_to_internal, time_to_frame, timeline_range,
-        trace_nudge_pixels, trail_cutoff_time, trail_pace_index, trail_points, zoom_pan_for_cursor,
+        ensure_keyframe_at_time, estimate_frame_translation, expected_motion_analysis_samples,
+        frame_time, internal_to_style_scale, keyframe_index_at_time, parse_frame_rate,
+        parse_video_dimension, playback_frame_deadline, position_on_path, preview_stream_is_ready,
+        preview_tracer_zoom_scale, project_trail_points, read_mjpeg_frame,
+        scaled_tracer_dimensions, smooth_keyframes, snap_trim_time, step_frame,
+        style_scale_to_internal, time_to_frame, timeline_range, trace_nudge_pixels,
+        trail_cutoff_time, trail_pace_index, trail_points, zoom_pan_for_cursor,
         zoomed_preview_rect, CameraMotionSample, Keyframe, Project, TracerStyle, MAX_CANVAS_ZOOM,
         TRACER_GLOW_MAX, TRACER_WIDTH_MAX,
     };
@@ -3342,6 +3347,18 @@ mod tests {
         assert_eq!(parse_frame_rate("29.97"), Some(29.97));
         assert_eq!(parse_frame_rate("0/0"), None);
         assert_eq!(parse_frame_rate("N/A"), None);
+    }
+
+    #[test]
+    fn video_dimension_parser_reads_named_or_plain_positive_values() {
+        assert_eq!(parse_video_dimension("width=1920\n", "width"), Some(1920));
+        assert_eq!(parse_video_dimension("1080\n", "height"), Some(1080));
+        assert_eq!(
+            parse_video_dimension("height=1080\nwidth=1920\n", "width"),
+            Some(1920)
+        );
+        assert_eq!(parse_video_dimension("width=N/A\n", "width"), None);
+        assert_eq!(parse_video_dimension("width=0\n", "width"), None);
     }
 
     #[test]
@@ -3700,7 +3717,63 @@ mod tests {
     }
 
     #[test]
-    fn stepping_frames_copies_keyframe_position_into_adjacent_unkeyed_frames() {
+    fn arrow_frame_steps_navigate_adjacent_frames() {
+        assert_eq!(step_frame(30, 1, 0, 89), Some(31));
+        assert_eq!(step_frame(31, 1, 0, 89), Some(32));
+        assert_eq!(step_frame(32, -1, 0, 89), Some(31));
+        assert_eq!(step_frame(89, 1, 0, 89), None);
+        assert_eq!(step_frame(0, -1, 0, 89), None);
+    }
+
+    #[test]
+    fn nudging_creates_keyframe_at_the_current_interpolated_position() {
+        let mut project = Project {
+            video_path: PathBuf::new(),
+            duration: 4.0,
+            frame_rate: 30.0,
+            trim_in: 0.0,
+            trim_out: 4.0,
+            keyframes: vec![
+                Keyframe {
+                    time: 0.0,
+                    x: 0.2,
+                    y: 0.3,
+                },
+                Keyframe {
+                    time: 2.0,
+                    x: 0.8,
+                    y: 0.7,
+                },
+                Keyframe {
+                    time: 4.0,
+                    x: 0.4,
+                    y: 0.9,
+                },
+            ],
+            camera_motion: Vec::new(),
+            camera_motion_enabled: false,
+            path_smoothing: 0.8,
+            trail_duration: 5.0,
+            trail_pace: 0.5,
+            tracer: TracerStyle::default(),
+        };
+        let frame = step_frame(30, 1, 0, 119).and_then(|frame| step_frame(frame, 1, 0, 119));
+        assert_eq!(frame, Some(32));
+        let time = frame_time(frame.unwrap(), 30.0);
+        let smoothed = smooth_keyframes(&project.keyframes, project.path_smoothing);
+        let expected_position = position_on_path(&smoothed, time);
+        let earlier_keyframe = project.keyframes[0].x;
+        let index = ensure_keyframe_at_time(&mut project, time)
+            .expect("nudge should create a keyframe on the current frame");
+        assert_eq!(project.keyframes.len(), 4);
+        assert_eq!(project.keyframes[index].time, time);
+        assert!((project.keyframes[index].x - expected_position.0).abs() < 0.0001);
+        assert!((project.keyframes[index].y - expected_position.1).abs() < 0.0001);
+        assert!((project.keyframes[index].x - earlier_keyframe).abs() > 0.1);
+    }
+
+    #[test]
+    fn nudging_before_first_keyframe_uses_the_visible_path_position() {
         let mut project = Project {
             video_path: PathBuf::new(),
             duration: 3.0,
@@ -3719,37 +3792,13 @@ mod tests {
             trail_pace: 0.5,
             tracer: TracerStyle::default(),
         };
-        assert_eq!(step_keyframe_frame(&mut project, 30, 1, 0, 89), Some(31));
+        let index = ensure_keyframe_at_time(&mut project, frame_time(29, 30.0))
+            .expect("nudge before first point should still seed from existing position");
         assert_eq!(project.keyframes.len(), 2);
-        assert_eq!(project.keyframes[1].time, frame_time(31, 30.0));
         assert_eq!(
-            (project.keyframes[1].x, project.keyframes[1].y),
+            (project.keyframes[index].x, project.keyframes[index].y),
             (0.42, 0.63)
         );
-        assert_eq!(step_keyframe_frame(&mut project, 31, -1, 0, 89), Some(30));
-        assert_eq!(project.keyframes.len(), 2);
-    }
-
-    #[test]
-    fn stepping_without_a_current_keyframe_does_not_create_one() {
-        let mut project = Project {
-            video_path: PathBuf::new(),
-            duration: 3.0,
-            frame_rate: 30.0,
-            trim_in: 0.0,
-            trim_out: 3.0,
-            keyframes: Vec::new(),
-            camera_motion: Vec::new(),
-            camera_motion_enabled: false,
-            path_smoothing: 0.5,
-            trail_duration: 5.0,
-            trail_pace: 0.5,
-            tracer: TracerStyle::default(),
-        };
-        assert_eq!(step_keyframe_frame(&mut project, 30, 1, 0, 89), Some(31));
-        assert!(project.keyframes.is_empty());
-        assert_eq!(step_keyframe_frame(&mut project, 89, 1, 0, 89), None);
-        assert_eq!(step_keyframe_frame(&mut project, 0, -1, 0, 89), None);
     }
 
     #[test]
