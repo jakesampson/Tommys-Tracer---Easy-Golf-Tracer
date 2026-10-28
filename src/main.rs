@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 const EXPORT_FPS: u32 = 30;
 const FRAME_LIMIT: u32 = 60 * 60 * 30;
 const PREVIEW_MAX_DIMENSION: u32 = 720;
+const MAX_CANVAS_ZOOM: f32 = 8.0;
 const TRACER_REFERENCE_HEIGHT: f32 = 1080.0;
 const TRACER_WIDTH_MAX: f32 = 16.0;
 const TRACER_GLOW_MAX: f32 = 24.0;
@@ -111,6 +112,7 @@ struct TracerApp {
     preview: Option<egui::TextureHandle>,
     tracer_glow: Option<egui::TextureHandle>,
     preview_size: [usize; 2],
+    canvas_zoom: CanvasZoom,
     motion_receiver: Option<Receiver<MotionAnalysisMessage>>,
     motion_cancel: Option<Arc<AtomicBool>>,
     motion_analysis_selection: Option<(PathBuf, f32, f32)>,
@@ -121,6 +123,24 @@ struct TracerApp {
     export_progress: f32,
     export_phase: String,
     status: String,
+}
+
+struct CanvasZoom {
+    scale: f32,
+    pan: Vec2,
+    dragging_keyframe: bool,
+    keyframe_drag_offset: Vec2,
+}
+
+impl Default for CanvasZoom {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            pan: Vec2::ZERO,
+            dragging_keyframe: false,
+            keyframe_drag_offset: Vec2::ZERO,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -227,6 +247,7 @@ impl TracerApp {
             preview: None,
             tracer_glow: None,
             preview_size: [0, 0],
+            canvas_zoom: CanvasZoom::default(),
             motion_receiver: None,
             motion_cancel: None,
             motion_analysis_selection: None,
@@ -267,6 +288,7 @@ impl TracerApp {
                     path_smoothing: default_path_smoothing(),
                     tracer: TracerStyle::default(),
                 });
+                self.canvas_zoom = CanvasZoom::default();
                 self.playhead_frame = 0;
                 self.is_playing = false;
                 self.screen = AppScreen::Trim;
@@ -439,6 +461,7 @@ impl TracerApp {
                 project.camera_motion_enabled &= !project.camera_motion.is_empty();
                 self.playhead_frame = time_to_frame(project.trim_in, project.frame_rate);
                 self.project = Some(project);
+                self.canvas_zoom = CanvasZoom::default();
                 self.is_playing = false;
                 self.screen = AppScreen::Trace;
                 self.request_preview();
@@ -622,7 +645,12 @@ impl TracerApp {
                     &mut self.playhead_frame,
                     &mut self.is_playing,
                     &mut self.timeline_drag,
-                    (&self.preview, self.preview_size, &mut self.tracer_glow),
+                    (
+                        &self.preview,
+                        self.preview_size,
+                        &mut self.tracer_glow,
+                        &mut self.canvas_zoom,
+                    ),
                     true,
                 );
             });
@@ -845,9 +873,9 @@ impl TracerApp {
                             project.keyframes.clear();
                         }
                     });
-                    if project.keyframes.is_empty() {
-                        ui.label("Click the video preview to place a keyframe.");
-                    }
+                    ui.label(
+                        "Click the preview to add a keyframe. Drag the tracer point at the current frame to move it. Use WASD to nudge it by one preview pixel.",
+                    );
                     let mut remove_index = None;
                     for (index, keyframe) in project.keyframes.iter().enumerate() {
                         ui.horizontal(|ui| {
@@ -885,7 +913,12 @@ impl TracerApp {
                 &mut self.playhead_frame,
                 &mut self.is_playing,
                 &mut self.timeline_drag,
-                (&self.preview, self.preview_size, &mut self.tracer_glow),
+                (
+                    &self.preview,
+                    self.preview_size,
+                    &mut self.tracer_glow,
+                    &mut self.canvas_zoom,
+                ),
                 false,
             );
         });
@@ -1088,6 +1121,7 @@ fn draw_video_editor(
         &Option<egui::TextureHandle>,
         [usize; 2],
         &mut Option<egui::TextureHandle>,
+        &mut CanvasZoom,
     ),
     trim_mode: bool,
 ) -> EditorInteraction {
@@ -1117,39 +1151,273 @@ fn draw_video_editor(
         Stroke::new(1.0_f32, Color32::from_white_alpha(28)),
         egui::StrokeKind::Inside,
     );
-    if let Some(texture) = preview_data.0 {
-        let aspect = preview_data.1[0] as f32 / preview_data.1[1].max(1) as f32;
-        let size = fit_size(video_area.size(), aspect);
-        let rect = Rect::from_center_size(video_area.center(), size);
-        let response = ui.interact(rect, ui.id().with("video-preview"), Sense::click());
-        ui.painter().image(
+    let base_preview_rect = if preview_data.1[0] > 0 && preview_data.1[1] > 0 {
+        let aspect = preview_data.1[0] as f32 / preview_data.1[1] as f32;
+        Some(Rect::from_center_size(
+            video_area.center(),
+            fit_size(video_area.size(), aspect),
+        ))
+    } else {
+        None
+    };
+    let zoom_controls_rect = Rect::from_min_size(
+        Pos2::new(video_area.right() - 166.0, video_area.top() + 10.0),
+        Vec2::new(156.0, 34.0),
+    );
+    if let (Some(texture), Some(base_rect)) = (preview_data.0, base_preview_rect) {
+        let zoom = preview_data.3;
+        let image_rect = if trim_mode {
+            base_rect
+        } else {
+            zoomed_preview_rect(video_area, base_rect.size(), zoom.scale, zoom.pan)
+        };
+        let canvas_response = ui.interact(
+            video_area,
+            ui.id().with("video-preview-canvas"),
+            Sense::click_and_drag(),
+        );
+        let painter = ui.painter().with_clip_rect(video_area);
+        painter.image(
             texture.id(),
-            rect,
+            image_rect,
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
             Color32::WHITE,
         );
+        let mut zoom_changed = false;
+        let controls_hovered = !trim_mode
+            && canvas_response
+                .interact_pointer_pos()
+                .is_some_and(|pointer| zoom_controls_rect.contains(pointer));
         if !trim_mode {
-            draw_preview_tracer(
-                ui,
-                rect,
-                project,
-                frame_time(*playhead_frame, project.frame_rate),
-                preview_data.2,
-            );
-            if response.clicked() {
-                if let Some(position) = response.interact_pointer_pos() {
-                    let time = frame_time(*playhead_frame, project.frame_rate);
-                    let (offset_x, offset_y) = camera_motion_offset(project, time);
-                    add_keyframe(
-                        project,
-                        time,
-                        (((position.x - rect.left()) / rect.width()) - offset_x).clamp(0.0, 1.0),
-                        (((position.y - rect.top()) / rect.height()) - offset_y).clamp(0.0, 1.0),
-                    );
+            let panning = canvas_response.dragged_by(egui::PointerButton::Secondary);
+            if panning {
+                zoom.pan += canvas_response.drag_delta();
+                zoom_changed = true;
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+
+            if !controls_hovered {
+                if let Some(pointer) = canvas_response.hover_pos() {
+                    if video_area.contains(pointer) {
+                        let scroll_y = ui.input(|input| input.raw_scroll_delta.y);
+                        if scroll_y != 0.0 {
+                            let next_scale =
+                                (zoom.scale * (1.0 + scroll_y * 0.002)).clamp(1.0, MAX_CANVAS_ZOOM);
+                            if (next_scale - zoom.scale).abs() > f32::EPSILON {
+                                zoom.pan = zoom_pan_for_cursor(
+                                    video_area,
+                                    image_rect,
+                                    base_rect.size(),
+                                    pointer,
+                                    next_scale,
+                                );
+                                zoom.scale = next_scale;
+                                zoom_changed = true;
+                            }
+                        }
+
+                        if canvas_response.drag_started_by(egui::PointerButton::Primary) {
+                            if let Some(pointer) = canvas_response.interact_pointer_pos() {
+                                let time = frame_time(*playhead_frame, project.frame_rate);
+                                if let Some(index) = keyframe_index_at_time(
+                                    &project.keyframes,
+                                    time,
+                                    project.frame_rate,
+                                ) {
+                                    let (offset_x, offset_y) = camera_motion_offset(project, time);
+                                    let keyframe = &project.keyframes[index];
+                                    let keyframe_position = Pos2::new(
+                                        image_rect.left()
+                                            + (keyframe.x + offset_x) * image_rect.width(),
+                                        image_rect.top()
+                                            + (keyframe.y + offset_y) * image_rect.height(),
+                                    );
+                                    if pointer.distance(keyframe_position) <= 18.0 {
+                                        zoom.dragging_keyframe = true;
+                                        zoom.keyframe_drag_offset = pointer - keyframe_position;
+                                    }
+                                }
+                            }
+                        }
+
+                        if zoom.dragging_keyframe
+                            && canvas_response.dragged_by(egui::PointerButton::Primary)
+                        {
+                            if let (Some(pointer), Some(index)) = (
+                                canvas_response.interact_pointer_pos(),
+                                keyframe_index_at_time(
+                                    &project.keyframes,
+                                    frame_time(*playhead_frame, project.frame_rate),
+                                    project.frame_rate,
+                                ),
+                            ) {
+                                let time = frame_time(*playhead_frame, project.frame_rate);
+                                let (offset_x, offset_y) = camera_motion_offset(project, time);
+                                let position = pointer - zoom.keyframe_drag_offset;
+                                project.keyframes[index].x = ((position.x - image_rect.left())
+                                    / image_rect.width()
+                                    - offset_x)
+                                    .clamp(0.0, 1.0);
+                                project.keyframes[index].y = ((position.y - image_rect.top())
+                                    / image_rect.height()
+                                    - offset_y)
+                                    .clamp(0.0, 1.0);
+                            }
+                        }
+                        if canvas_response.drag_stopped_by(egui::PointerButton::Primary) {
+                            zoom.dragging_keyframe = false;
+                            zoom.keyframe_drag_offset = Vec2::ZERO;
+                        }
+                    }
                 }
             }
         }
+
+        if !trim_mode {
+            if !ui.ctx().wants_keyboard_input()
+                && !controls_hovered
+                && !canvas_response.dragged()
+                && canvas_response.has_focus()
+            {
+                let (horizontal, vertical, fine_nudge, step_backward, step_forward) =
+                    ui.input(|input| {
+                        (
+                            (if input.key_pressed(egui::Key::D) {
+                                1.0
+                            } else {
+                                0.0
+                            }) - (if input.key_pressed(egui::Key::A) {
+                                1.0
+                            } else {
+                                0.0
+                            }),
+                            (if input.key_pressed(egui::Key::S) {
+                                1.0
+                            } else {
+                                0.0
+                            }) - (if input.key_pressed(egui::Key::W) {
+                                1.0
+                            } else {
+                                0.0
+                            }),
+                            input.modifiers.shift,
+                            input.key_pressed(egui::Key::ArrowLeft),
+                            input.key_pressed(egui::Key::ArrowRight),
+                        )
+                    });
+                if step_backward || step_forward {
+                    let direction = if step_forward { 1 } else { -1 };
+                    if let Some(next_frame) = step_keyframe_frame(
+                        project,
+                        *playhead_frame,
+                        direction,
+                        first_frame,
+                        last_edit_frame,
+                    ) {
+                        *playhead_frame = next_frame;
+                        interaction.stop_playback = *is_playing;
+                        interaction.refresh_preview = true;
+                    }
+                }
+                let nudge = Vec2::new(horizontal, vertical);
+                if nudge != Vec2::ZERO {
+                    let time = frame_time(*playhead_frame, project.frame_rate);
+                    if let Some(index) =
+                        keyframe_index_at_time(&project.keyframes, time, project.frame_rate)
+                    {
+                        let pixels = if fine_nudge { 1.0 } else { 10.0 };
+                        project.keyframes[index].x = (project.keyframes[index].x
+                            + nudge.x * pixels / image_rect.width())
+                        .clamp(0.0, 1.0);
+                        project.keyframes[index].y = (project.keyframes[index].y
+                            + nudge.y * pixels / image_rect.height())
+                        .clamp(0.0, 1.0);
+                    }
+                }
+            }
+            draw_preview_tracer(
+                ui,
+                &painter,
+                image_rect,
+                project,
+                frame_time(*playhead_frame, project.frame_rate),
+                zoom.scale,
+                preview_data.2,
+            );
+            if canvas_response.clicked_by(egui::PointerButton::Primary)
+                || canvas_response.drag_started_by(egui::PointerButton::Primary)
+            {
+                canvas_response.request_focus();
+            }
+            if !zoom.dragging_keyframe
+                && !controls_hovered
+                && !canvas_response.dragged()
+                && canvas_response.clicked_by(egui::PointerButton::Primary)
+            {
+                if let Some(position) = canvas_response.interact_pointer_pos() {
+                    if image_rect.contains(position) {
+                        let time = frame_time(*playhead_frame, project.frame_rate);
+                        let (offset_x, offset_y) = camera_motion_offset(project, time);
+                        add_keyframe(
+                            project,
+                            time,
+                            (((position.x - image_rect.left()) / image_rect.width()) - offset_x)
+                                .clamp(0.0, 1.0),
+                            (((position.y - image_rect.top()) / image_rect.height()) - offset_y)
+                                .clamp(0.0, 1.0),
+                        );
+                    }
+                }
+            }
+        }
+
+        if !trim_mode {
+            egui::Area::new(ui.id().with("zoom-controls"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(zoom_controls_rect.min)
+                .constrain_to(video_area)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(19, 29, 41, 225))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(36)))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(5, 3))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("-").clicked() {
+                                    zoom.scale = (zoom.scale - 0.25).max(1.0);
+                                    if zoom.scale == 1.0 {
+                                        zoom.pan = Vec2::ZERO;
+                                    }
+                                    zoom_changed = true;
+                                }
+                                ui.label(format!("{:.0}%", zoom.scale * 100.0));
+                                if ui.small_button("+").clicked() {
+                                    zoom.scale = (zoom.scale + 0.25).min(MAX_CANVAS_ZOOM);
+                                    zoom_changed = true;
+                                }
+                                if ui.small_button("Reset").clicked() {
+                                    zoom.scale = 1.0;
+                                    zoom.pan = Vec2::ZERO;
+                                    zoom_changed = true;
+                                }
+                            });
+                        });
+                });
+        }
+
+        if zoom_changed {
+            zoom.pan = clamp_canvas_pan(video_area, base_rect.size() * zoom.scale, zoom.pan);
+        }
     } else {
+        ui.painter()
+            .rect_filled(video_area, 12.0, Color32::from_rgb(9, 15, 23));
+        ui.painter().rect_stroke(
+            video_area,
+            12.0,
+            Stroke::new(1.0_f32, Color32::from_white_alpha(28)),
+            egui::StrokeKind::Inside,
+        );
         ui.painter().text(
             video_area.center(),
             egui::Align2::CENTER_CENTER,
@@ -1176,11 +1444,6 @@ fn draw_video_editor(
             .show(ui, |ui| {
                 ui.set_min_width((transport_card_width - 20.0).max(0.0));
                 ui.horizontal(|ui| {
-                    if ui.button("|◀").clicked() {
-                        interaction.stop_playback = *is_playing;
-                        *playhead_frame = first_frame;
-                        interaction.refresh_preview = true;
-                    }
                     if ui.button("◀ Frame").clicked() {
                         interaction.stop_playback = *is_playing;
                         *playhead_frame = playhead_frame.saturating_sub(1).max(first_frame);
@@ -1210,11 +1473,6 @@ fn draw_video_editor(
                     if ui.button("Frame ▶").clicked() {
                         interaction.stop_playback = *is_playing;
                         *playhead_frame = playhead_frame.saturating_add(1).min(last_edit_frame);
-                        interaction.refresh_preview = true;
-                    }
-                    if ui.button("▶|").clicked() {
-                        *playhead_frame = last_edit_frame;
-                        interaction.stop_playback = *is_playing;
                         interaction.refresh_preview = true;
                     }
                     ui.separator();
@@ -1275,6 +1533,35 @@ fn fit_size(available: Vec2, aspect: f32) -> Vec2 {
     } else {
         Vec2::new(width, width / aspect)
     }
+}
+
+fn zoomed_preview_rect(canvas: Rect, base_size: Vec2, scale: f32, pan: Vec2) -> Rect {
+    let scale = scale.clamp(1.0, MAX_CANVAS_ZOOM);
+    let size = base_size * scale;
+    let pan = clamp_canvas_pan(canvas, size, pan);
+    Rect::from_center_size(canvas.center() + pan, size)
+}
+
+fn clamp_canvas_pan(canvas: Rect, image_size: Vec2, pan: Vec2) -> Vec2 {
+    let max_x = ((image_size.x - canvas.width()) * 0.5).max(0.0);
+    let max_y = ((image_size.y - canvas.height()) * 0.5).max(0.0);
+    Vec2::new(pan.x.clamp(-max_x, max_x), pan.y.clamp(-max_y, max_y))
+}
+
+fn zoom_pan_for_cursor(
+    canvas: Rect,
+    image: Rect,
+    base_size: Vec2,
+    pointer: Pos2,
+    next_scale: f32,
+) -> Vec2 {
+    let image_uv = Vec2::new(
+        (pointer.x - image.left()) / image.width(),
+        (pointer.y - image.top()) / image.height(),
+    );
+    let next_size = base_size * next_scale;
+    let pan = pointer - canvas.center() - Vec2::new(image_uv.x - 0.5, image_uv.y - 0.5) * next_size;
+    clamp_canvas_pan(canvas, next_size, pan)
 }
 
 fn frame_time(frame: u64, frame_rate: f32) -> f32 {
@@ -1342,6 +1629,32 @@ fn draw_timeline(
     let trim_end_x = x_at_time(project.trim_out);
     let playhead_time = frame_time(*playhead_frame, project.frame_rate);
     let playhead_x = x_at_time(playhead_time);
+    let starting_trim_drag = allow_trimming
+        && response.drag_started()
+        && response.interact_pointer_pos().is_some_and(|pointer| {
+            (pointer.x - trim_start_x)
+                .abs()
+                .min((pointer.x - trim_end_x).abs())
+                <= 16.0
+        });
+    let active_trim_drag = allow_trimming
+        && ((matches!(
+            *drag_mode,
+            Some(TimelineDrag::TrimIn | TimelineDrag::TrimOut)
+        ) && !response.drag_stopped())
+            || starting_trim_drag);
+    if allow_trimming {
+        let hovering_trim_handle = response.hovered()
+            && response.interact_pointer_pos().is_some_and(|pointer| {
+                (pointer.x - trim_start_x)
+                    .abs()
+                    .min((pointer.x - trim_end_x).abs())
+                    <= 16.0
+            });
+        if active_trim_drag || hovering_trim_handle {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+    }
 
     painter.text(
         Pos2::new(track.left(), rect.top() + 4.0),
@@ -1458,26 +1771,32 @@ fn draw_timeline(
             Color32::from_rgb(95, 211, 147),
         );
     }
-    painter.line_segment(
-        [
+    if !active_trim_drag {
+        painter.line_segment(
+            [
+                Pos2::new(playhead_x, rect.top() + 20.0),
+                Pos2::new(playhead_x, track.bottom() + 2.0),
+            ],
+            Stroke::new(2.0_f32, Color32::WHITE),
+        );
+        painter.circle_filled(
             Pos2::new(playhead_x, rect.top() + 20.0),
-            Pos2::new(playhead_x, track.bottom() + 2.0),
-        ],
-        Stroke::new(2.0_f32, Color32::WHITE),
-    );
-    painter.circle_filled(
-        Pos2::new(playhead_x, rect.top() + 20.0),
-        4.0,
-        Color32::WHITE,
-    );
+            4.0,
+            Color32::WHITE,
+        );
+    }
 
     if response.drag_started() {
         if let Some(pointer) = response.interact_pointer_pos() {
+            let start_distance = (pointer.x - trim_start_x).abs();
+            let end_distance = (pointer.x - trim_end_x).abs();
             *drag_mode = Some(
-                if allow_trimming && (pointer.x - trim_start_x).abs() <= 10.0 {
-                    TimelineDrag::TrimIn
-                } else if allow_trimming && (pointer.x - trim_end_x).abs() <= 10.0 {
-                    TimelineDrag::TrimOut
+                if allow_trimming && start_distance.min(end_distance) <= 16.0 {
+                    if start_distance <= end_distance {
+                        TimelineDrag::TrimIn
+                    } else {
+                        TimelineDrag::TrimOut
+                    }
                 } else {
                     TimelineDrag::Playhead
                 },
@@ -1541,11 +1860,60 @@ fn add_keyframe(project: &mut Project, time: f32, x: f32, y: f32) {
     project.keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
 }
 
+fn keyframe_index_at_time(keyframes: &[Keyframe], time: f32, frame_rate: f32) -> Option<usize> {
+    let tolerance = 0.5 / frame_rate.max(1.0);
+    keyframes
+        .iter()
+        .enumerate()
+        .min_by(|(_, first), (_, second)| {
+            (first.time - time)
+                .abs()
+                .total_cmp(&(second.time - time).abs())
+        })
+        .filter(|(_, keyframe)| (keyframe.time - time).abs() <= tolerance)
+        .map(|(index, _)| index)
+}
+
+fn step_keyframe_frame(
+    project: &mut Project,
+    current_frame: u64,
+    direction: i8,
+    first_frame: u64,
+    last_frame: u64,
+) -> Option<u64> {
+    let target_frame = match direction.cmp(&0) {
+        std::cmp::Ordering::Less => current_frame.checked_sub(1)?.max(first_frame),
+        std::cmp::Ordering::Greater => current_frame.saturating_add(1).min(last_frame),
+        std::cmp::Ordering::Equal => return None,
+    };
+    if target_frame == current_frame {
+        return None;
+    }
+
+    let current_time = frame_time(current_frame, project.frame_rate);
+    let target_time = frame_time(target_frame, project.frame_rate);
+    let current_keyframe =
+        keyframe_index_at_time(&project.keyframes, current_time, project.frame_rate)
+            .map(|index| (project.keyframes[index].x, project.keyframes[index].y));
+    if keyframe_index_at_time(&project.keyframes, target_time, project.frame_rate).is_none() {
+        if let Some((x, y)) = current_keyframe {
+            add_keyframe(project, target_time, x, y);
+        }
+    }
+    Some(target_frame)
+}
+
+fn endpoint_marker_scale(zoom_scale: f32) -> f32 {
+    zoom_scale.max(1.0).sqrt().recip().clamp(0.35, 1.0)
+}
+
 fn draw_preview_tracer(
     ui: &egui::Ui,
+    painter: &egui::Painter,
     rect: Rect,
     project: &Project,
     time: f32,
+    zoom_scale: f32,
     glow_texture: &mut Option<egui::TextureHandle>,
 ) {
     let (width, glow) = scaled_tracer_dimensions(&project.tracer, rect.height());
@@ -1580,7 +1948,7 @@ fn draw_preview_tracer(
             ));
         }
         if let Some(texture) = glow_texture {
-            ui.painter().image(
+            painter.image(
                 texture.id(),
                 rect,
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
@@ -1603,10 +1971,10 @@ fn draw_preview_tracer(
         project.tracer.color[2],
     );
     for segment in points.windows(2) {
-        draw_preview_segment(ui, segment[0], segment[1], width, color);
+        draw_preview_segment(painter, segment[0], segment[1], width, color);
     }
     if let Some(point) = points.last() {
-        ui.painter().circle_filled(*point, width, color);
+        painter.circle_filled(*point, width * endpoint_marker_scale(zoom_scale), color);
     }
 }
 
@@ -1615,15 +1983,19 @@ fn scaled_tracer_dimensions(style: &TracerStyle, canvas_height: f32) -> (f32, f3
     (style.width * scale, style.glow * scale)
 }
 
-fn draw_preview_segment(ui: &egui::Ui, start: Pos2, end: Pos2, width: f32, color: Color32) {
+fn draw_preview_segment(
+    painter: &egui::Painter,
+    start: Pos2,
+    end: Pos2,
+    width: f32,
+    color: Color32,
+) {
     let distance = start.distance(end);
     if distance <= 0.0 {
-        ui.painter()
-            .line_segment([start, end], Stroke::new(width, color));
+        painter.line_segment([start, end], Stroke::new(width, color));
         return;
     }
-    ui.painter()
-        .line_segment([start, end], Stroke::new(width, color));
+    painter.line_segment([start, end], Stroke::new(width, color));
 }
 
 fn probe_video_info(path: &Path) -> Result<(f32, f32), String> {
@@ -2651,13 +3023,16 @@ fn apply_app_theme(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::{
-        camera_motion_offset, draw_feathered_path, estimate_frame_translation,
-        expected_motion_analysis_samples, frame_time, internal_to_style_scale,
-        playback_frame_deadline, preview_stream_is_ready, project_trail_points, read_mjpeg_frame,
-        scaled_tracer_dimensions, smooth_keyframes, snap_trim_time, style_scale_to_internal,
-        time_to_frame, timeline_range, trail_points, CameraMotionSample, Keyframe, Project,
-        TracerStyle, TRACER_GLOW_MAX, TRACER_WIDTH_MAX,
+        camera_motion_offset, draw_feathered_path, endpoint_marker_scale,
+        estimate_frame_translation, expected_motion_analysis_samples, frame_time,
+        internal_to_style_scale, keyframe_index_at_time, playback_frame_deadline,
+        preview_stream_is_ready, project_trail_points, read_mjpeg_frame, scaled_tracer_dimensions,
+        smooth_keyframes, snap_trim_time, step_keyframe_frame, style_scale_to_internal,
+        time_to_frame, timeline_range, trail_points, zoom_pan_for_cursor, zoomed_preview_rect,
+        CameraMotionSample, Keyframe, Project, TracerStyle, MAX_CANVAS_ZOOM, TRACER_GLOW_MAX,
+        TRACER_WIDTH_MAX,
     };
+    use eframe::egui::{Pos2, Rect, Vec2};
     use image::{Rgba, RgbaImage};
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -2708,6 +3083,43 @@ mod tests {
         let (export_width, export_glow) = scaled_tracer_dimensions(&style, 2160.0);
         assert_eq!((preview_width, preview_glow), (4.0, 6.0));
         assert_eq!((export_width, export_glow), (16.0, 24.0));
+    }
+
+    #[test]
+    fn preview_zoom_keeps_the_pointer_anchor_fixed() {
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 450.0));
+        let image = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 450.0));
+        let pointer = Pos2::new(600.0, 300.0);
+        let pan = zoom_pan_for_cursor(canvas, image, image.size(), pointer, 2.0);
+        let zoomed = zoomed_preview_rect(canvas, image.size(), 2.0, pan);
+        let anchor = Pos2::new(
+            zoomed.left() + 0.75 * zoomed.width(),
+            zoomed.top() + (2.0 / 3.0) * zoomed.height(),
+        );
+        assert!((anchor.x - pointer.x).abs() < 0.001);
+        assert!((anchor.y - pointer.y).abs() < 0.001);
+    }
+
+    #[test]
+    fn preview_zoom_and_pan_stay_within_supported_bounds() {
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 450.0));
+        let image = zoomed_preview_rect(
+            canvas,
+            Vec2::new(800.0, 450.0),
+            MAX_CANVAS_ZOOM + 1.0,
+            Vec2::new(10_000.0, -10_000.0),
+        );
+        assert_eq!(image.width(), 800.0 * MAX_CANVAS_ZOOM);
+        assert_eq!(image.left(), canvas.left());
+        assert_eq!(image.bottom(), canvas.bottom());
+    }
+
+    #[test]
+    fn endpoint_marker_scales_down_gently_as_canvas_zoom_increases() {
+        assert_eq!(endpoint_marker_scale(1.0), 1.0);
+        assert_eq!(endpoint_marker_scale(4.0), 0.5);
+        assert!(endpoint_marker_scale(8.0) > 0.35);
+        assert!(endpoint_marker_scale(8.0) < endpoint_marker_scale(4.0));
     }
 
     #[test]
@@ -2834,6 +3246,74 @@ mod tests {
         project.camera_motion_enabled = false;
         assert_eq!(camera_motion_offset(&project, 0.5), (0.0, 0.0));
         assert_eq!(project_trail_points(&project, 0.5), vec![(0.3, 0.4)]);
+    }
+
+    #[test]
+    fn keyframe_editing_targets_the_keyframe_at_the_current_frame() {
+        let keys = [
+            Keyframe {
+                time: 0.0,
+                x: 0.2,
+                y: 0.3,
+            },
+            Keyframe {
+                time: 1.0,
+                x: 0.7,
+                y: 0.8,
+            },
+        ];
+        assert_eq!(keyframe_index_at_time(&keys, 1.0, 30.0), Some(1));
+        assert_eq!(keyframe_index_at_time(&keys, 1.02, 30.0), None);
+        assert_eq!(keyframe_index_at_time(&keys, 0.01, 30.0), Some(0));
+    }
+
+    #[test]
+    fn stepping_frames_copies_keyframe_position_into_adjacent_unkeyed_frames() {
+        let mut project = Project {
+            video_path: PathBuf::new(),
+            duration: 3.0,
+            frame_rate: 30.0,
+            trim_in: 0.0,
+            trim_out: 3.0,
+            keyframes: vec![Keyframe {
+                time: 1.0,
+                x: 0.42,
+                y: 0.63,
+            }],
+            camera_motion: Vec::new(),
+            camera_motion_enabled: false,
+            path_smoothing: 0.5,
+            tracer: TracerStyle::default(),
+        };
+        assert_eq!(step_keyframe_frame(&mut project, 30, 1, 0, 89), Some(31));
+        assert_eq!(project.keyframes.len(), 2);
+        assert_eq!(project.keyframes[1].time, frame_time(31, 30.0));
+        assert_eq!(
+            (project.keyframes[1].x, project.keyframes[1].y),
+            (0.42, 0.63)
+        );
+        assert_eq!(step_keyframe_frame(&mut project, 31, -1, 0, 89), Some(30));
+        assert_eq!(project.keyframes.len(), 2);
+    }
+
+    #[test]
+    fn stepping_without_a_current_keyframe_does_not_create_one() {
+        let mut project = Project {
+            video_path: PathBuf::new(),
+            duration: 3.0,
+            frame_rate: 30.0,
+            trim_in: 0.0,
+            trim_out: 3.0,
+            keyframes: Vec::new(),
+            camera_motion: Vec::new(),
+            camera_motion_enabled: false,
+            path_smoothing: 0.5,
+            tracer: TracerStyle::default(),
+        };
+        assert_eq!(step_keyframe_frame(&mut project, 30, 1, 0, 89), Some(31));
+        assert!(project.keyframes.is_empty());
+        assert_eq!(step_keyframe_frame(&mut project, 89, 1, 0, 89), None);
+        assert_eq!(step_keyframe_frame(&mut project, 0, -1, 0, 89), None);
     }
 
     #[test]
