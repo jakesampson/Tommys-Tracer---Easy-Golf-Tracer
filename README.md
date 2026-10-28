@@ -51,4 +51,6 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+If a release run fails after the tag has been pushed, first push the workflow fix to `main`, then run **Build release packages** from the Actions tab with the existing version tag as the `release_tag` input. This rebuilds from that tag and publishes without moving or recreating it.
+
 The workflow creates a Windows x86_64 ZIP, a universal macOS `.app` ZIP for Intel and Apple Silicon, and a Linux x86_64 tarball, then attaches them to a GitHub Release with generated notes. Packages include installation instructions. FFmpeg and FFprobe are external requirements and are not bundled. The macOS app is not signed or notarized, so macOS may require users to Control-click and choose **Open** the first time.
