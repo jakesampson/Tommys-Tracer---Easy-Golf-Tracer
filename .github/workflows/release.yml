@@ -88,6 +88,8 @@ jobs:
               --disable-nonfree \
               --disable-autodetect \
               --disable-x86asm \
+              --enable-zlib \
+              --enable-decoder=png \
               --enable-videotoolbox \
               --enable-audiotoolbox \
               --enable-static \
@@ -112,6 +114,10 @@ jobs:
             lipo "bundled-ffmpeg/$tool" -verify_arch arm64 x86_64
           done
           bundled-ffmpeg/ffmpeg -hide_banner -encoders | grep -q h264_videotoolbox
+          if ! bundled-ffmpeg/ffmpeg -hide_banner -decoders | grep -Eq '[[:space:]]png[[:space:]]'; then
+            echo "PNG decoder is required to composite tracer frames." >&2
+            exit 1
+          fi
           if bundled-ffmpeg/ffmpeg -hide_banner -encoders | grep -q libx264; then
             echo "GPL libx264 encoder must not be present in the LGPL bundle." >&2
             exit 1

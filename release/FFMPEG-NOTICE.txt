@@ -8,6 +8,7 @@ ffmpeg-7.1.1.tar.xz, is published as a separate asset alongside this
 application's GitHub release. The executables were built for arm64 and
 x86_64 with --disable-gpl, --disable-nonfree, and --disable-autodetect,
 and with VideoToolbox and AudioToolbox enabled. No third-party external
-libraries were enabled.
+libraries were enabled except the system-provided zlib, which supports
+decoding the PNG tracer frames used during export.
 
 The macOS app uses FFmpeg's h264_videotoolbox encoder for MP4 exports.
