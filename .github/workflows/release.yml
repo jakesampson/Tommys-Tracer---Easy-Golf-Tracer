@@ -57,15 +57,78 @@ jobs:
             target/aarch64-apple-darwin/release/tommys-tracer \
             target/x86_64-apple-darwin/release/tommys-tracer \
             -output universal/tommys-tracer
+      - name: Build bundled LGPL FFmpeg tools
+        env:
+          FFMPEG_VERSION: 7.1.1
+        run: |
+          SOURCE_ARCHIVE="$RUNNER_TEMP/ffmpeg-$FFMPEG_VERSION.tar.xz"
+          SOURCE_DIR="$RUNNER_TEMP/ffmpeg-$FFMPEG_VERSION"
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          curl --fail --location --retry 3 \
+            "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" \
+            --output "$SOURCE_ARCHIVE"
+          tar -xf "$SOURCE_ARCHIVE" -C "$RUNNER_TEMP"
+
+          build_arch() {
+            local ffmpeg_arch="$1"
+            local compiler_arch="$2"
+            local prefix="$3"
+            cd "$SOURCE_DIR"
+            make distclean >/dev/null 2>&1 || true
+            ./configure \
+              --prefix="$prefix" \
+              --arch="$ffmpeg_arch" \
+              --target-os=darwin \
+              --enable-cross-compile \
+              --cc="clang -arch $compiler_arch" \
+              --sysroot="$SDKROOT" \
+              --extra-cflags="-arch $compiler_arch -mmacosx-version-min=11.0" \
+              --extra-ldflags="-arch $compiler_arch -mmacosx-version-min=11.0" \
+              --disable-gpl \
+              --disable-nonfree \
+              --disable-autodetect \
+              --disable-x86asm \
+              --enable-videotoolbox \
+              --enable-audiotoolbox \
+              --enable-static \
+              --disable-shared \
+              --disable-debug \
+              --disable-doc
+            make -j"$(sysctl -n hw.ncpu)"
+            make install
+          }
+
+          build_arch aarch64 arm64 "$RUNNER_TEMP/ffmpeg-arm64"
+          build_arch x86_64 x86_64 "$RUNNER_TEMP/ffmpeg-x86_64"
+          mkdir -p bundled-ffmpeg
+          for tool in ffmpeg ffprobe; do
+            lipo -create \
+              "$RUNNER_TEMP/ffmpeg-arm64/bin/$tool" \
+              "$RUNNER_TEMP/ffmpeg-x86_64/bin/$tool" \
+              -output "bundled-ffmpeg/$tool"
+            strip -x "bundled-ffmpeg/$tool"
+            chmod 755 "bundled-ffmpeg/$tool"
+            lipo -verify_arch arm64 x86_64 "bundled-ffmpeg/$tool"
+          done
+          bundled-ffmpeg/ffmpeg -hide_banner -encoders | grep -q h264_videotoolbox
+          if bundled-ffmpeg/ffmpeg -hide_banner -encoders | grep -q libx264; then
+            echo "GPL libx264 encoder must not be present in the LGPL bundle." >&2
+            exit 1
+          fi
+          cp "$SOURCE_ARCHIVE" "ffmpeg-$FFMPEG_VERSION.tar.xz"
+          cp "$SOURCE_DIR/COPYING.LGPLv2.1" bundled-ffmpeg/FFmpeg-LGPLv2.1.txt
       - name: Package app
         run: |
           APP="Tommy's Tracer.app"
           CONTENTS="$APP/Contents"
           ICONSET="$RUNNER_TEMP/TommyTracer.iconset"
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_REF#v}"
           mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$ICONSET"
           cp universal/tommys-tracer "$CONTENTS/MacOS/tommys-tracer"
+          cp bundled-ffmpeg/ffmpeg bundled-ffmpeg/ffprobe "$CONTENTS/MacOS/"
+          cp bundled-ffmpeg/FFmpeg-LGPLv2.1.txt "$CONTENTS/Resources/"
           cp release/README.txt "$CONTENTS/Resources/README.txt"
+          cp release/FFMPEG-NOTICE.txt "$CONTENTS/Resources/"
 
           ICON_SOURCE="assets/branding/app_icon_small_variant.png"
           make_icon_size() {
@@ -113,10 +176,14 @@ jobs:
           PLIST
           printf 'APPL????' > "$CONTENTS/PkgInfo"
           ditto -c -k --sequesterRsrc --keepParent "$APP" tommys-tracer-macos-universal.zip
+        env:
+          RELEASE_REF: ${{ inputs.release_tag || github.ref_name }}
       - uses: actions/upload-artifact@v4
         with:
           name: macos-package
-          path: tommys-tracer-macos-universal.zip
+          path: |
+            tommys-tracer-macos-universal.zip
+            ffmpeg-7.1.1.tar.xz
           if-no-files-found: error
 
   linux:

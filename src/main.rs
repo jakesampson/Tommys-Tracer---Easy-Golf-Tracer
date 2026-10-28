@@ -2180,8 +2180,44 @@ fn probe_video_info(path: &Path) -> Result<(f32, f32), String> {
     Ok((probe_duration(path)?, probe_frame_rate(path)?))
 }
 
+fn multimedia_tool_command(tool: &str) -> Result<Command, String> {
+    #[cfg(target_os = "macos")]
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|directory| directory.join(tool)))
+        .filter(|candidate| candidate.is_file());
+    #[cfg(not(target_os = "macos"))]
+    let bundled: Option<PathBuf> = None;
+
+    let from_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join(multimedia_tool_filename(tool)))
+        .find(|candidate| candidate.is_file());
+    #[cfg(target_os = "macos")]
+    let from_homebrew = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
+        .into_iter()
+        .map(|directory| Path::new(directory).join(tool))
+        .find(|candidate| candidate.is_file());
+    #[cfg(not(target_os = "macos"))]
+    let from_homebrew: Option<PathBuf> = None;
+
+    let executable = bundled.or(from_path).or(from_homebrew).ok_or_else(|| {
+        format!("Could not find {tool}. Install FFmpeg and ensure it is available.")
+    })?;
+    Ok(Command::new(executable))
+}
+
+fn multimedia_tool_filename(tool: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        if Path::new(tool).extension().is_none() {
+            return format!("{tool}.exe");
+        }
+    }
+    tool.to_owned()
+}
+
 fn probe_frame_rate(path: &Path) -> Result<f32, String> {
-    let output = Command::new("ffprobe")
+    let output = multimedia_tool_command("ffprobe")?
         .args([
             "-v",
             "error",
@@ -2240,7 +2276,7 @@ fn parse_frame_rate(value: &str) -> Option<f32> {
 }
 
 fn probe_duration(path: &Path) -> Result<f32, String> {
-    let output = Command::new("ffprobe")
+    let output = multimedia_tool_command("ffprobe")?
         .args([
             "-v",
             "error",
@@ -2430,7 +2466,7 @@ fn start_preview_stream(
     time: f32,
     frame_rate: f32,
 ) -> Result<(PlaybackStream, PreviewFrame), String> {
-    let mut child = Command::new("ffmpeg")
+    let mut child = multimedia_tool_command("ffmpeg")?
         .args([
             "-v",
             "error",
@@ -2544,7 +2580,7 @@ fn analyze_camera_motion(
     let duration = project.trim_out - project.trim_in;
     let expected_frames = expected_motion_analysis_samples(duration);
 
-    let mut child = Command::new("ffmpeg")
+    let mut child = multimedia_tool_command("ffmpeg")?
         .args(["-v", "error", "-ss"])
         .arg(format!("{:.6}", project.trim_in))
         .arg("-i")
@@ -2862,7 +2898,7 @@ fn export_project(
 }
 
 fn probe_video_dimension(path: &Path, dimension: &str) -> Result<u32, String> {
-    let output = Command::new("ffprobe")
+    let output = multimedia_tool_command("ffprobe")?
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
         .arg(format!("stream={dimension}"))
         .args(["-of", "default=noprint_wrappers=1"])
@@ -3174,7 +3210,8 @@ fn encode_export(
     report_progress: &mut impl FnMut(f32, &str),
 ) -> Result<(), String> {
     let pattern = frame_dir.join("overlay_%06d.png");
-    let mut child = Command::new("ffmpeg")
+    let mut command = multimedia_tool_command("ffmpeg")?;
+    command
         .args(["-y", "-v", "error", "-ss"])
         .arg(format!("{:.3}", project.trim_in))
         .arg("-i")
@@ -3192,12 +3229,13 @@ fn encode_export(
             "[outv]",
             "-map",
             "0:a?",
-            "-c:v",
-            "libx264",
-            "-crf",
-            "18",
-            "-preset",
-            "medium",
+        ]);
+    #[cfg(target_os = "macos")]
+    command.args(["-c:v", "h264_videotoolbox", "-b:v", "10M", "-allow_sw", "1"]);
+    #[cfg(not(target_os = "macos"))]
+    command.args(["-c:v", "libx264", "-crf", "18", "-preset", "medium"]);
+    let mut child = command
+        .args([
             "-pix_fmt",
             "yuv420p",
             "-c:a",
@@ -3211,9 +3249,7 @@ fn encode_export(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| {
-            format!("Could not start ffmpeg. Install FFmpeg and add it to PATH: {error}")
-        })?;
+        .map_err(|error| format!("Could not start FFmpeg export: {error}"))?;
     let stdout = child
         .stdout
         .take()

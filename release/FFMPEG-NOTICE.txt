@@ -1,0 +1,13 @@
+Tommy's Tracer for macOS includes universal FFmpeg and FFprobe executables
+built from FFmpeg 7.1.1. FFmpeg is licensed under the GNU Lesser General
+Public License, version 2.1 or later. A copy of the license is included as
+FFmpeg-LGPLv2.1.txt in this app bundle.
+
+The corresponding unmodified FFmpeg 7.1.1 source archive,
+ffmpeg-7.1.1.tar.xz, is published as a separate asset alongside this
+application's GitHub release. The executables were built for arm64 and
+x86_64 with --disable-gpl, --disable-nonfree, and --disable-autodetect,
+and with VideoToolbox and AudioToolbox enabled. No third-party external
+libraries were enabled.
+
+The macOS app uses FFmpeg's h264_videotoolbox encoder for MP4 exports.
