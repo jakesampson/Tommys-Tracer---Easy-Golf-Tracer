@@ -100,6 +100,7 @@ jobs:
 
           build_arch aarch64 arm64 "$RUNNER_TEMP/ffmpeg-arm64"
           build_arch x86_64 x86_64 "$RUNNER_TEMP/ffmpeg-x86_64"
+          cd "$GITHUB_WORKSPACE"
           mkdir -p bundled-ffmpeg
           for tool in ffmpeg ffprobe; do
             lipo -create \
