@@ -108,7 +108,7 @@ jobs:
               -output "bundled-ffmpeg/$tool"
             strip -x "bundled-ffmpeg/$tool"
             chmod 755 "bundled-ffmpeg/$tool"
-            lipo -verify_arch arm64 x86_64 "bundled-ffmpeg/$tool"
+            lipo "bundled-ffmpeg/$tool" -verify_arch arm64 x86_64
           done
           bundled-ffmpeg/ffmpeg -hide_banner -encoders | grep -q h264_videotoolbox
           if bundled-ffmpeg/ffmpeg -hide_banner -encoders | grep -q libx264; then
