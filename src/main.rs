@@ -151,6 +151,29 @@ impl MaskRegion {
         }
     }
 
+    // Moves the whole shape; an animated mask gets (or updates) a keyframe at this time.
+    fn translate(&mut self, delta: (f32, f32), time: f32, frame_rate: f32) {
+        let target = if self.keyframes.is_empty() {
+            &mut self.points
+        } else {
+            let index = self.ensure_keyframe(time, frame_rate);
+            &mut self.keyframes[index].points
+        };
+        let (mut min_x, mut max_x, mut min_y, mut max_y) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for point in target.iter() {
+            min_x = min_x.min(point.0);
+            max_x = max_x.max(point.0);
+            min_y = min_y.min(point.1);
+            max_y = max_y.max(point.1);
+        }
+        let dx = delta.0.clamp(-min_x, 1.0 - max_x);
+        let dy = delta.1.clamp(-min_y, 1.0 - max_y);
+        for point in target.iter_mut() {
+            point.0 += dx;
+            point.1 += dy;
+        }
+    }
+
     fn remove_vertex(&mut self, vertex: usize) {
         if self.points.len() <= 3 || vertex >= self.points.len() {
             return;
@@ -315,6 +338,7 @@ struct CanvasZoom {
     mask_draft: Vec<(f32, f32)>,
     selected_mask: Option<usize>,
     dragging_vertex: Option<usize>,
+    dragging_shape: bool,
     picking_colour: bool,
     pick_request: Option<(f32, f32)>,
 }
@@ -331,6 +355,7 @@ impl Default for CanvasZoom {
             mask_draft: Vec::new(),
             selected_mask: None,
             dragging_vertex: None,
+            dragging_shape: false,
             picking_colour: false,
             pick_request: None,
         }
@@ -2696,6 +2721,39 @@ fn draw_preview_tracer(
     }
 }
 
+fn point_in_polygon(point: Pos2, polygon: &[Pos2]) -> bool {
+    let mut inside = false;
+    let mut previous = polygon.len().saturating_sub(1);
+    for (index, current) in polygon.iter().enumerate() {
+        let other = polygon[previous];
+        if (current.y > point.y) != (other.y > point.y)
+            && point.x
+                < (other.x - current.x) * (point.y - current.y) / (other.y - current.y) + current.x
+        {
+            inside = !inside;
+        }
+        previous = index;
+    }
+    inside
+}
+
+fn mask_fill_mesh(points: &[(f32, f32)], to_screen: impl Fn((f32, f32)) -> Pos2) -> egui::Mesh {
+    let fill = Color32::from_rgba_unmultiplied(255, 214, 90, 128);
+    let mut mesh = egui::Mesh::default();
+    for point in points {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: to_screen(*point),
+            uv: egui::epaint::WHITE_UV,
+            color: fill,
+        });
+    }
+    for triangle in triangulate_polygon(points) {
+        mesh.indices
+            .extend(triangle.iter().map(|&index| index as u32));
+    }
+    mesh
+}
+
 fn distance_to_segment(point: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
     let length_squared = ab.length_sq();
@@ -2748,7 +2806,19 @@ fn edit_selected_mask(
             .map(|(index, _)| index)
     };
     if response.drag_started_by(egui::PointerButton::Primary) && !controls_hovered {
-        zoom.dragging_vertex = response.interact_pointer_pos().and_then(nearest_vertex);
+        let start = response.interact_pointer_pos();
+        zoom.dragging_vertex = start.and_then(nearest_vertex);
+        zoom.dragging_shape = zoom.dragging_vertex.is_none()
+            && start.is_some_and(|position| point_in_polygon(position, &shape));
+    }
+    if zoom.dragging_shape && response.dragged_by(egui::PointerButton::Primary) {
+        let delta = response.drag_delta();
+        region.translate(
+            (delta.x / rect.width(), delta.y / rect.height()),
+            time,
+            frame_rate,
+        );
+        ui_cursor_grab(response);
     }
     if let (Some(vertex), Some(position)) = (zoom.dragging_vertex, response.interact_pointer_pos())
     {
@@ -2759,6 +2829,7 @@ fn edit_selected_mask(
     }
     if response.drag_stopped_by(egui::PointerButton::Primary) {
         zoom.dragging_vertex = None;
+        zoom.dragging_shape = false;
     }
     if controls_hovered || response.dragged() || !response.clicked_by(egui::PointerButton::Primary)
     {
@@ -2829,6 +2900,7 @@ fn draw_preview_masks(
             } else {
                 Color32::from_rgb(120, 200, 255)
             };
+            painter.add(egui::Shape::mesh(mask_fill_mesh(&shape, to_screen)));
             painter.add(egui::Shape::closed_line(
                 outline.clone(),
                 Stroke::new(if selected { 2.0_f32 } else { 1.5_f32 }, color),
@@ -2859,6 +2931,12 @@ fn draw_preview_masks(
             .iter()
             .map(|point| to_screen(*point))
             .collect();
+        if zoom.mask_draft.len() >= 3 {
+            painter.add(egui::Shape::mesh(mask_fill_mesh(
+                &zoom.mask_draft,
+                to_screen,
+            )));
+        }
         painter.add(egui::Shape::line(
             outline.clone(),
             Stroke::new(2.0_f32, Color32::from_rgb(255, 214, 90)),
@@ -6002,5 +6080,35 @@ mod tests {
                 "frame {index}: {x},{y}"
             );
         }
+    }
+
+    #[test]
+    fn whole_mask_moves_and_stays_inside_the_frame() {
+        let mut mask = super::MaskRegion::new(vec![(0.1, 0.1), (0.3, 0.1), (0.3, 0.3)]);
+        mask.translate((0.2, 0.1), 0.0, 30.0);
+        assert!((mask.points[0].0 - 0.3).abs() < 1e-5 && (mask.points[2].1 - 0.4).abs() < 1e-5);
+        mask.translate((5.0, -5.0), 0.0, 30.0);
+        assert!((mask.points[1].0 - 1.0).abs() < 1e-5 && mask.points[0].1.abs() < 1e-5);
+        let mut animated = super::MaskRegion::new(vec![(0.1, 0.1), (0.3, 0.1), (0.3, 0.3)]);
+        animated.ensure_keyframe(0.0, 30.0);
+        animated.translate((0.1, 0.0), 1.0, 30.0);
+        assert_eq!(animated.keyframes.len(), 2);
+        assert!((animated.shape_at(1.0)[0].0 - 0.2).abs() < 1e-5);
+        assert!((animated.shape_at(0.0)[0].0 - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn point_in_polygon_handles_concave_shapes() {
+        use crate::egui::Pos2;
+        let shape = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(10.0, 0.0),
+            Pos2::new(10.0, 10.0),
+            Pos2::new(5.0, 4.0),
+            Pos2::new(0.0, 10.0),
+        ];
+        assert!(super::point_in_polygon(Pos2::new(2.0, 2.0), &shape));
+        assert!(!super::point_in_polygon(Pos2::new(5.0, 8.0), &shape));
+        assert!(!super::point_in_polygon(Pos2::new(12.0, 2.0), &shape));
     }
 }
