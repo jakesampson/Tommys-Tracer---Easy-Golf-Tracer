@@ -1140,13 +1140,9 @@ impl TracerApp {
                             self.canvas_zoom.selected_mask = None;
                         }
                     });
-                    ui.label(
-                        "Outline an object the ball passes behind. The tracer is hidden inside the shape in the preview and the export.",
-                    );
                     if self.canvas_zoom.mask_editing {
-                        ui.label(
-                            "Click the preview to add corners. Click the first point (or Finish) to close the shape.",
-                        );
+                        ui.label("Click the preview to add corners.")
+                            .on_hover_text("Click the first point (or Finish) to close the shape.");
                         ui.horizontal(|ui| {
                             if ui
                                 .add_enabled(
@@ -1169,7 +1165,13 @@ impl TracerApp {
                                 self.canvas_zoom.mask_editing = false;
                             }
                         });
-                    } else if ui.button("Draw mask").clicked() {
+                    } else if ui
+                        .button("Draw mask")
+                        .on_hover_text(
+                            "Outline an object the ball passes behind. The tracer is hidden inside the shape in the preview and the export.",
+                        )
+                        .clicked()
+                    {
                         self.canvas_zoom.mask_draft.clear();
                         self.canvas_zoom.selected_mask = None;
                         self.canvas_zoom.mask_editing = true;
@@ -1179,13 +1181,12 @@ impl TracerApp {
                         ui.horizontal(|ui| {
                             let selected = self.canvas_zoom.selected_mask == Some(index);
                             let label = format!(
-                                "Mask {} ({} points{})",
+                                "Mask {}{}",
                                 index + 1,
-                                project.masks[index].points.len(),
                                 if project.masks[index].keyframes.is_empty() {
                                     String::new()
                                 } else {
-                                    format!(", {} keyframes", project.masks[index].keyframes.len())
+                                    format!(" ({} keyframes)", project.masks[index].keyframes.len())
                                 }
                             );
                             if ui.selectable_label(selected, label).clicked() && !selected {
@@ -1211,11 +1212,14 @@ impl TracerApp {
                         .and_then(|index| project.masks.get_mut(index))
                     {
                         let time = frame_time(self.playhead_frame, project.frame_rate);
-                        ui.label(
-                            "Drag corners to reshape. Click an edge to add a corner; Shift+click a corner to delete it. Add keyframes at different times and the shape morphs between them. Moving a corner on an animated mask creates a keyframe at the playhead.",
-                        );
                         ui.horizontal(|ui| {
-                            if ui.button("Keyframe at playhead").clicked() {
+                            if ui
+                                .button("Keyframe at playhead")
+                                .on_hover_text(
+                                    "Drag corners to reshape. Click an edge to add a corner; Shift+click a corner to delete it. The shape morphs between keyframes.",
+                                )
+                                .clicked()
+                            {
                                 region.ensure_keyframe(time, project.frame_rate);
                             }
                             if ui.button("Done").clicked() {
@@ -1223,11 +1227,20 @@ impl TracerApp {
                             }
                         });
                         let mut remove_keyframe = None;
-                        for (index, keyframe) in region.keyframes.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("Mask keyframe {:.3}s", keyframe.time));
-                                if ui.small_button("x").clicked() {
-                                    remove_keyframe = Some(index);
+                        if !region.keyframes.is_empty() {
+                            egui::CollapsingHeader::new(format!(
+                                "Mask keyframes ({})",
+                                region.keyframes.len()
+                            ))
+                            .id_salt("mask_keyframes")
+                            .show(ui, |ui| {
+                                for (index, keyframe) in region.keyframes.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{:.3}s", keyframe.time));
+                                        if ui.small_button("x").clicked() {
+                                            remove_keyframe = Some(index);
+                                        }
+                                    });
                                 }
                             });
                         }
@@ -1241,7 +1254,7 @@ impl TracerApp {
                     ui.separator();
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.heading("Keyframes");
+                        ui.heading("Tracer");
                         if ui
                             .small_button(
                                 egui::RichText::new("Clear")
@@ -1251,26 +1264,30 @@ impl TracerApp {
                         {
                             project.keyframes.clear();
                         }
-                    });
-                    ui.label(
-                        "Click the preview to add a keyframe. Arrow keys browse frames without adding points; WASD nudges the tracer where it currently appears, creating a keyframe only when needed. Nudges are 10 preview pixels, 5 when zoomed past 400%, or 1 with Shift.",
+                    })
+                    .response
+                    .on_hover_text(
+                        "Click the preview to add a keyframe. Arrow keys browse frames; WASD nudges the tracer (10 preview pixels, 5 when zoomed past 400%, 1 with Shift).",
                     );
                     let mut remove_index = None;
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .max_height(ui.available_height())
+                    egui::CollapsingHeader::new(format!("Keyframes ({})", project.keyframes.len()))
+                        .id_salt("tracer_keyframes")
                         .show(ui, |ui| {
-                            for (index, keyframe) in project.keyframes.iter().enumerate() {
-                                ui.horizontal(|ui| {
-                                    ui.label(format!(
-                                        "{:.3}s  ({:.2}, {:.2})",
-                                        keyframe.time, keyframe.x, keyframe.y
-                                    ));
-                                    if ui.small_button("x").clicked() {
-                                        remove_index = Some(index);
+                            egui::ScrollArea::vertical()
+                                .max_height(ui.available_height())
+                                .show(ui, |ui| {
+                                    for (index, keyframe) in project.keyframes.iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!(
+                                                "{:.3}s  ({:.2}, {:.2})",
+                                                keyframe.time, keyframe.x, keyframe.y
+                                            ));
+                                            if ui.small_button("x").clicked() {
+                                                remove_index = Some(index);
+                                            }
+                                        });
                                     }
                                 });
-                            }
                         });
                     if let Some(index) = remove_index {
                         project.keyframes.remove(index);
