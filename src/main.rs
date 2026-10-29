@@ -1278,10 +1278,21 @@ impl TracerApp {
                                 .show(ui, |ui| {
                                     for (index, keyframe) in project.keyframes.iter().enumerate() {
                                         ui.horizontal(|ui| {
-                                            ui.label(format!(
-                                                "{:.3}s  ({:.2}, {:.2})",
-                                                keyframe.time, keyframe.x, keyframe.y
-                                            ));
+                                            let frame =
+                                                time_to_frame(keyframe.time, project.frame_rate);
+                                            if ui
+                                                .selectable_label(
+                                                    frame == self.playhead_frame,
+                                                    format!(
+                                                        "{:.3}s  ({:.2}, {:.2})",
+                                                        keyframe.time, keyframe.x, keyframe.y
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.playhead_frame = frame;
+                                                self.is_playing = false;
+                                            }
                                             if ui.small_button("x").clicked() {
                                                 remove_index = Some(index);
                                             }
