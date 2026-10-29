@@ -47,9 +47,119 @@ struct Keyframe {
 }
 
 // A polygon in normalized video coordinates; the tracer is hidden inside it.
+// With keyframes, each vertex moves linearly between them (all shapes share one vertex count).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct MaskRegion {
     points: Vec<(f32, f32)>,
+    #[serde(default)]
+    keyframes: Vec<MaskKeyframe>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MaskKeyframe {
+    time: f32,
+    points: Vec<(f32, f32)>,
+}
+
+impl MaskRegion {
+    fn new(points: Vec<(f32, f32)>) -> Self {
+        Self {
+            points,
+            keyframes: Vec::new(),
+        }
+    }
+
+    fn shape_at(&self, time: f32) -> Vec<(f32, f32)> {
+        let (Some(first), Some(last)) = (self.keyframes.first(), self.keyframes.last()) else {
+            return self.points.clone();
+        };
+        if time <= first.time {
+            return first.points.clone();
+        }
+        if time >= last.time {
+            return last.points.clone();
+        }
+        let next = self
+            .keyframes
+            .iter()
+            .position(|keyframe| keyframe.time > time)
+            .unwrap_or(self.keyframes.len() - 1);
+        let (a, b) = (&self.keyframes[next - 1], &self.keyframes[next]);
+        let amount = (time - a.time) / (b.time - a.time).max(f32::EPSILON);
+        a.points
+            .iter()
+            .zip(&b.points)
+            .map(|(p, q)| (p.0 + (q.0 - p.0) * amount, p.1 + (q.1 - p.1) * amount))
+            .collect()
+    }
+
+    fn keyframe_index_at(&self, time: f32, frame_rate: f32) -> Option<usize> {
+        self.keyframes
+            .iter()
+            .position(|keyframe| (keyframe.time - time).abs() < 0.5 / frame_rate)
+    }
+
+    fn ensure_keyframe(&mut self, time: f32, frame_rate: f32) -> usize {
+        if let Some(index) = self.keyframe_index_at(time, frame_rate) {
+            return index;
+        }
+        let keyframe = MaskKeyframe {
+            time,
+            points: self.shape_at(time),
+        };
+        let index = self
+            .keyframes
+            .iter()
+            .position(|existing| existing.time > time)
+            .unwrap_or(self.keyframes.len());
+        self.keyframes.insert(index, keyframe);
+        index
+    }
+
+    // Moves a vertex; an animated mask gets (or updates) a keyframe at this time.
+    fn set_vertex(&mut self, vertex: usize, point: (f32, f32), time: f32, frame_rate: f32) {
+        if self.keyframes.is_empty() {
+            if let Some(slot) = self.points.get_mut(vertex) {
+                *slot = point;
+            }
+            return;
+        }
+        let index = self.ensure_keyframe(time, frame_rate);
+        if let Some(slot) = self.keyframes[index].points.get_mut(vertex) {
+            *slot = point;
+        }
+    }
+
+    // Adds a vertex after `edge_start` in every shape, placed at `point` for the current shape.
+    fn insert_vertex(&mut self, edge_start: usize, point: (f32, f32), time: f32, frame_rate: f32) {
+        let insert = |points: &mut Vec<(f32, f32)>| {
+            let a = points[edge_start];
+            let b = points[(edge_start + 1) % points.len()];
+            points.insert(edge_start + 1, ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5));
+        };
+        if edge_start >= self.points.len() {
+            return;
+        }
+        let current = (!self.keyframes.is_empty()).then(|| self.ensure_keyframe(time, frame_rate));
+        insert(&mut self.points);
+        for keyframe in &mut self.keyframes {
+            insert(&mut keyframe.points);
+        }
+        match current {
+            Some(index) => self.keyframes[index].points[edge_start + 1] = point,
+            None => self.points[edge_start + 1] = point,
+        }
+    }
+
+    fn remove_vertex(&mut self, vertex: usize) {
+        if self.points.len() <= 3 || vertex >= self.points.len() {
+            return;
+        }
+        self.points.remove(vertex);
+        for keyframe in &mut self.keyframes {
+            keyframe.points.remove(vertex);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -196,6 +306,8 @@ struct CanvasZoom {
     keyboard_active: bool,
     mask_editing: bool,
     mask_draft: Vec<(f32, f32)>,
+    selected_mask: Option<usize>,
+    dragging_vertex: Option<usize>,
 }
 
 impl Default for CanvasZoom {
@@ -208,6 +320,8 @@ impl Default for CanvasZoom {
             keyboard_active: false,
             mask_editing: false,
             mask_draft: Vec::new(),
+            selected_mask: None,
+            dragging_vertex: None,
         }
     }
 }
@@ -1023,6 +1137,7 @@ impl TracerApp {
                                 .clicked()
                         {
                             project.masks.clear();
+                            self.canvas_zoom.selected_mask = None;
                         }
                     });
                     ui.label(
@@ -1040,9 +1155,10 @@ impl TracerApp {
                                 )
                                 .clicked()
                             {
-                                project.masks.push(MaskRegion {
-                                    points: std::mem::take(&mut self.canvas_zoom.mask_draft),
-                                });
+                                project.masks.push(MaskRegion::new(std::mem::take(
+                                    &mut self.canvas_zoom.mask_draft,
+                                )));
+                                self.canvas_zoom.selected_mask = Some(project.masks.len() - 1);
                                 self.canvas_zoom.mask_editing = false;
                             }
                             if ui.button("Undo point").clicked() {
@@ -1055,23 +1171,72 @@ impl TracerApp {
                         });
                     } else if ui.button("Draw mask").clicked() {
                         self.canvas_zoom.mask_draft.clear();
+                        self.canvas_zoom.selected_mask = None;
                         self.canvas_zoom.mask_editing = true;
                     }
                     let mut remove_mask = None;
                     for index in 0..project.masks.len() {
                         ui.horizontal(|ui| {
-                            ui.label(format!(
-                                "Mask {} ({} points)",
+                            let selected = self.canvas_zoom.selected_mask == Some(index);
+                            let label = format!(
+                                "Mask {} ({} points{})",
                                 index + 1,
-                                project.masks[index].points.len()
-                            ));
-                            if ui.small_button("x").clicked() {
+                                project.masks[index].points.len(),
+                                if project.masks[index].keyframes.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(", {} keyframes", project.masks[index].keyframes.len())
+                                }
+                            );
+                            if ui.selectable_label(selected, label).clicked() && !selected {
+                                self.canvas_zoom.selected_mask = Some(index);
+                                self.canvas_zoom.mask_editing = false;
+                                self.canvas_zoom.mask_draft.clear();
+                            } else if ui.small_button("x").clicked() {
                                 remove_mask = Some(index);
                             }
                         });
                     }
                     if let Some(index) = remove_mask {
                         project.masks.remove(index);
+                        self.canvas_zoom.selected_mask = match self.canvas_zoom.selected_mask {
+                            Some(selected) if selected == index => None,
+                            Some(selected) if selected > index => Some(selected - 1),
+                            other => other,
+                        };
+                    }
+                    if let Some(region) = self
+                        .canvas_zoom
+                        .selected_mask
+                        .and_then(|index| project.masks.get_mut(index))
+                    {
+                        let time = frame_time(self.playhead_frame, project.frame_rate);
+                        ui.label(
+                            "Drag corners to reshape. Click an edge to add a corner; Shift+click a corner to delete it. Add keyframes at different times and the shape morphs between them. Moving a corner on an animated mask creates a keyframe at the playhead.",
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("Keyframe at playhead").clicked() {
+                                region.ensure_keyframe(time, project.frame_rate);
+                            }
+                            if ui.button("Done").clicked() {
+                                self.canvas_zoom.selected_mask = None;
+                            }
+                        });
+                        let mut remove_keyframe = None;
+                        for (index, keyframe) in region.keyframes.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Mask keyframe {:.3}s", keyframe.time));
+                                if ui.small_button("x").clicked() {
+                                    remove_keyframe = Some(index);
+                                }
+                            });
+                        }
+                        if let Some(index) = remove_keyframe {
+                            if region.keyframes.len() == 1 {
+                                region.points = region.keyframes[0].points.clone();
+                            }
+                            region.keyframes.remove(index);
+                        }
                     }
                     ui.separator();
                     ui.add_space(4.0);
@@ -1536,6 +1701,7 @@ fn draw_video_editor(
 
                         if canvas_response.drag_started_by(egui::PointerButton::Primary)
                             && !zoom.mask_editing
+                            && zoom.selected_mask.is_none()
                         {
                             if let Some(pointer) = canvas_response.interact_pointer_pos() {
                                 let time = frame_time(*playhead_frame, project.frame_rate);
@@ -1603,11 +1769,31 @@ fn draw_video_editor(
                 zoom.scale,
                 preview_data.2,
             );
-            draw_preview_masks(&painter, image_rect, texture.id(), project, zoom);
+            let preview_time = frame_time(*playhead_frame, project.frame_rate);
+            draw_preview_masks(
+                &painter,
+                image_rect,
+                texture.id(),
+                project,
+                zoom,
+                preview_time,
+            );
             if canvas_response.clicked_by(egui::PointerButton::Primary)
                 || canvas_response.drag_started_by(egui::PointerButton::Primary)
             {
                 canvas_response.request_focus();
+            }
+            if zoom.selected_mask.is_some() && !zoom.mask_editing {
+                let shift = ui.input(|input| input.modifiers.shift);
+                edit_selected_mask(
+                    &canvas_response,
+                    image_rect,
+                    project,
+                    zoom,
+                    preview_time,
+                    shift,
+                    controls_hovered,
+                );
             }
             if zoom.mask_editing
                 && !controls_hovered
@@ -1630,16 +1816,18 @@ fn draw_video_editor(
                                     <= 12.0
                             });
                         if closes_shape {
-                            project.masks.push(MaskRegion {
-                                points: std::mem::take(&mut zoom.mask_draft),
-                            });
+                            project
+                                .masks
+                                .push(MaskRegion::new(std::mem::take(&mut zoom.mask_draft)));
+                            zoom.selected_mask = Some(project.masks.len() - 1);
                             zoom.mask_editing = false;
                         } else {
                             zoom.mask_draft.push(point);
                         }
                     }
                 }
-            } else if !zoom.dragging_keyframe
+            } else if zoom.selected_mask.is_none()
+                && !zoom.dragging_keyframe
                 && !controls_hovered
                 && !canvas_response.dragged()
                 && canvas_response.clicked_by(egui::PointerButton::Primary)
@@ -2271,12 +2459,108 @@ fn draw_preview_tracer(
     }
 }
 
+fn distance_to_segment(point: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let length_squared = ab.length_sq();
+    let t = if length_squared <= f32::EPSILON {
+        0.0
+    } else {
+        ((point - a).dot(ab) / length_squared).clamp(0.0, 1.0)
+    };
+    point.distance(a + ab * t)
+}
+
+// Drag corners to reshape, click an edge to add a corner, Shift+click a corner to delete it.
+fn edit_selected_mask(
+    response: &egui::Response,
+    rect: Rect,
+    project: &mut Project,
+    zoom: &mut CanvasZoom,
+    time: f32,
+    shift: bool,
+    controls_hovered: bool,
+) {
+    let Some(selected) = zoom.selected_mask else {
+        return;
+    };
+    let frame_rate = project.frame_rate;
+    let Some(region) = project.masks.get_mut(selected) else {
+        zoom.selected_mask = None;
+        return;
+    };
+    let to_screen = |(x, y): (f32, f32)| {
+        Pos2::new(
+            rect.left() + x * rect.width(),
+            rect.top() + y * rect.height(),
+        )
+    };
+    let to_normalized = |position: Pos2| {
+        (
+            ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+            ((position.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
+        )
+    };
+    let shape: Vec<Pos2> = region.shape_at(time).into_iter().map(to_screen).collect();
+    let nearest_vertex = |position: Pos2| {
+        shape
+            .iter()
+            .enumerate()
+            .map(|(index, point)| (index, point.distance(position)))
+            .filter(|(_, distance)| *distance <= 14.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(index, _)| index)
+    };
+    if response.drag_started_by(egui::PointerButton::Primary) && !controls_hovered {
+        zoom.dragging_vertex = response.interact_pointer_pos().and_then(nearest_vertex);
+    }
+    if let (Some(vertex), Some(position)) = (zoom.dragging_vertex, response.interact_pointer_pos())
+    {
+        if response.dragged_by(egui::PointerButton::Primary) {
+            region.set_vertex(vertex, to_normalized(position), time, frame_rate);
+            ui_cursor_grab(response);
+        }
+    }
+    if response.drag_stopped_by(egui::PointerButton::Primary) {
+        zoom.dragging_vertex = None;
+    }
+    if controls_hovered || response.dragged() || !response.clicked_by(egui::PointerButton::Primary)
+    {
+        return;
+    }
+    let Some(position) = response.interact_pointer_pos() else {
+        return;
+    };
+    if let Some(vertex) = nearest_vertex(position) {
+        if shift {
+            region.remove_vertex(vertex);
+        }
+        return;
+    }
+    let edge = (0..shape.len())
+        .map(|index| {
+            (
+                index,
+                distance_to_segment(position, shape[index], shape[(index + 1) % shape.len()]),
+            )
+        })
+        .filter(|(_, distance)| *distance <= 10.0)
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    if let Some((edge_start, _)) = edge {
+        region.insert_vertex(edge_start, to_normalized(position), time, frame_rate);
+    }
+}
+
+fn ui_cursor_grab(response: &egui::Response) {
+    response.ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+}
+
 fn draw_preview_masks(
     painter: &egui::Painter,
     rect: Rect,
     video_texture: egui::TextureId,
     project: &Project,
     zoom: &CanvasZoom,
+    time: f32,
 ) {
     let to_screen = |(x, y): (f32, f32)| {
         Pos2::new(
@@ -2285,30 +2569,51 @@ fn draw_preview_masks(
         )
     };
     // Repainting the video over the tracer makes the line pass behind the masked object.
-    for region in &project.masks {
+    for (region_index, region) in project.masks.iter().enumerate() {
+        let shape = region.shape_at(time);
         let mut mesh = egui::Mesh::with_texture(video_texture);
-        for point in &region.points {
+        for point in &shape {
             mesh.vertices.push(egui::epaint::Vertex {
                 pos: to_screen(*point),
                 uv: Pos2::new(point.0, point.1),
                 color: Color32::WHITE,
             });
         }
-        for triangle in triangulate_polygon(&region.points) {
+        for triangle in triangulate_polygon(&shape) {
             mesh.indices
                 .extend(triangle.iter().map(|&index| index as u32));
         }
         painter.add(egui::Shape::mesh(mesh));
-        if zoom.mask_editing {
-            let outline: Vec<Pos2> = region
-                .points
-                .iter()
-                .map(|point| to_screen(*point))
-                .collect();
+        let selected = zoom.selected_mask == Some(region_index);
+        if zoom.mask_editing || selected {
+            let outline: Vec<Pos2> = shape.iter().map(|point| to_screen(*point)).collect();
+            let color = if selected {
+                Color32::from_rgb(255, 214, 90)
+            } else {
+                Color32::from_rgb(120, 200, 255)
+            };
             painter.add(egui::Shape::closed_line(
-                outline,
-                Stroke::new(1.5_f32, Color32::from_rgb(120, 200, 255)),
+                outline.clone(),
+                Stroke::new(if selected { 2.0_f32 } else { 1.5_f32 }, color),
             ));
+            if selected {
+                let on_keyframe = region.keyframe_index_at(time, project.frame_rate).is_some();
+                for point in outline {
+                    painter.circle_filled(point, 5.5, color);
+                    painter.circle_stroke(
+                        point,
+                        5.5,
+                        Stroke::new(
+                            1.5_f32,
+                            if on_keyframe {
+                                Color32::from_rgb(255, 76, 48)
+                            } else {
+                                Color32::BLACK
+                            },
+                        ),
+                    );
+                }
+            }
         }
     }
     if zoom.mask_editing && !zoom.mask_draft.is_empty() {
@@ -3390,7 +3695,15 @@ fn render_overlay_frames(
     let rgb = project.tracer.color;
     let (line_width, glow) = scaled_tracer_dimensions(&project.tracer, height as f32);
     let mut last_report = Instant::now();
-    let mask_coverage = mask_coverage_image(width, height, &project.masks);
+    let animated_masks = project
+        .masks
+        .iter()
+        .any(|region| !region.keyframes.is_empty());
+    let static_coverage = if animated_masks {
+        None
+    } else {
+        mask_coverage_image(width, height, &project.masks, 0.0)
+    };
     for frame_index in 0..frames {
         let time = project.trim_in + frame_index as f32 / EXPORT_FPS as f32;
         let points = project_trail_points(project, time);
@@ -3416,7 +3729,10 @@ fn render_overlay_frames(
                 line_color,
             );
         }
-        if let Some(coverage) = &mask_coverage {
+        let animated_coverage = animated_masks
+            .then(|| mask_coverage_image(width, height, &project.masks, time))
+            .flatten();
+        if let Some(coverage) = static_coverage.as_ref().or(animated_coverage.as_ref()) {
             apply_mask_coverage(&mut image, coverage);
         }
         let frame_path = directory.join(format!("overlay_{frame_index:06}.png"));
@@ -3510,12 +3826,17 @@ fn triangulate_polygon(points: &[(f32, f32)]) -> Vec<[usize; 3]> {
 }
 
 // Coverage mask (255 inside any region) with a one pixel soft edge.
-fn mask_coverage_image(width: u32, height: u32, masks: &[MaskRegion]) -> Option<GrayImage> {
+fn mask_coverage_image(
+    width: u32,
+    height: u32,
+    masks: &[MaskRegion],
+    time: f32,
+) -> Option<GrayImage> {
     let mut coverage = GrayImage::new(width, height);
     let mut drawn = false;
     for region in masks {
         let mut polygon: Vec<imageproc::point::Point<i32>> = region
-            .points
+            .shape_at(time)
             .iter()
             .map(|(x, y)| {
                 imageproc::point::Point::new(
@@ -4553,16 +4874,72 @@ mod tests {
 
     #[test]
     fn export_mask_hides_the_tracer_only_inside_the_shape() {
-        let masks = [super::MaskRegion {
-            points: vec![(0.4, 0.0), (0.6, 0.0), (0.6, 1.0), (0.4, 1.0)],
-        }];
-        let coverage = super::mask_coverage_image(100, 10, &masks).expect("mask coverage");
+        let masks = [super::MaskRegion::new(vec![
+            (0.4, 0.0),
+            (0.6, 0.0),
+            (0.6, 1.0),
+            (0.4, 1.0),
+        ])];
+        let coverage = super::mask_coverage_image(100, 10, &masks, 0.0).expect("mask coverage");
         let mut image = RgbaImage::from_pixel(100, 10, Rgba([255, 0, 0, 255]));
         super::apply_mask_coverage(&mut image, &coverage);
         assert_eq!(image.get_pixel(10, 5).0[3], 255);
         assert_eq!(image.get_pixel(90, 5).0[3], 255);
         assert_eq!(image.get_pixel(50, 5).0[3], 0);
-        assert!(super::mask_coverage_image(100, 10, &[]).is_none());
+        assert!(super::mask_coverage_image(100, 10, &[], 0.0).is_none());
+    }
+
+    fn square(x: f32) -> Vec<(f32, f32)> {
+        vec![(x, 0.0), (x + 0.2, 0.0), (x + 0.2, 0.2), (x, 0.2)]
+    }
+
+    #[test]
+    fn animated_mask_interpolates_between_keyframes_and_holds_at_the_ends() {
+        let mut mask = super::MaskRegion::new(square(0.0));
+        assert_eq!(mask.shape_at(5.0), square(0.0));
+        mask.ensure_keyframe(1.0, 30.0);
+        mask.set_vertex(0, (0.5, 0.0), 3.0, 30.0);
+        assert_eq!(mask.keyframes.len(), 2);
+        assert_eq!(mask.shape_at(0.0), square(0.0));
+        assert_eq!(mask.shape_at(9.0)[0], (0.5, 0.0));
+        let halfway = mask.shape_at(2.0);
+        assert!((halfway[0].0 - 0.25).abs() < 1e-5);
+        assert_eq!(halfway[1], (0.2, 0.0));
+        // Editing at an existing keyframe time updates it instead of adding another.
+        mask.set_vertex(0, (0.6, 0.0), 3.0, 30.0);
+        assert_eq!(mask.keyframes.len(), 2);
+    }
+
+    #[test]
+    fn mask_vertices_can_be_added_and_removed_across_all_keyframes() {
+        let mut mask = super::MaskRegion::new(square(0.0));
+        mask.ensure_keyframe(0.0, 30.0);
+        mask.ensure_keyframe(2.0, 30.0);
+        mask.insert_vertex(0, (0.1, 0.05), 1.0, 30.0);
+        assert_eq!(mask.points.len(), 5);
+        assert_eq!(mask.keyframes.len(), 3);
+        assert!(mask.keyframes.iter().all(|k| k.points.len() == 5));
+        assert_eq!(mask.shape_at(1.0)[1], (0.1, 0.05));
+        mask.remove_vertex(1);
+        assert!(mask.keyframes.iter().all(|k| k.points.len() == 4));
+        mask.remove_vertex(1);
+        mask.remove_vertex(1);
+        assert_eq!(mask.points.len(), 3, "a mask always keeps three corners");
+    }
+
+    #[test]
+    fn export_mask_follows_keyframes_over_time() {
+        let mut mask = super::MaskRegion::new(vec![(0.0, 0.0), (0.2, 0.0), (0.2, 1.0), (0.0, 1.0)]);
+        mask.ensure_keyframe(0.0, 30.0);
+        for vertex in 0..4 {
+            let (x, y) = mask.points[vertex];
+            mask.set_vertex(vertex, (x + 0.6, y), 1.0, 30.0);
+        }
+        let masks = [mask];
+        let early = super::mask_coverage_image(100, 10, &masks, 0.0).unwrap();
+        let late = super::mask_coverage_image(100, 10, &masks, 1.0).unwrap();
+        assert!(early.get_pixel(10, 5).0[0] > 200 && late.get_pixel(10, 5).0[0] == 0);
+        assert!(late.get_pixel(70, 5).0[0] > 200 && early.get_pixel(70, 5).0[0] == 0);
     }
 
     #[test]
