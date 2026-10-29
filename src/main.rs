@@ -46,6 +46,12 @@ struct Keyframe {
     y: f32,
 }
 
+// A polygon in normalized video coordinates; the tracer is hidden inside it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MaskRegion {
+    points: Vec<(f32, f32)>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Project {
     video_path: PathBuf,
@@ -59,6 +65,8 @@ struct Project {
     camera_motion: Vec<CameraMotionSample>,
     #[serde(default)]
     camera_motion_enabled: bool,
+    #[serde(default)]
+    masks: Vec<MaskRegion>,
     #[serde(default = "default_path_smoothing")]
     path_smoothing: f32,
     #[serde(default = "default_trail_duration")]
@@ -186,6 +194,8 @@ struct CanvasZoom {
     dragging_keyframe: bool,
     keyframe_drag_offset: Vec2,
     keyboard_active: bool,
+    mask_editing: bool,
+    mask_draft: Vec<(f32, f32)>,
 }
 
 impl Default for CanvasZoom {
@@ -196,6 +206,8 @@ impl Default for CanvasZoom {
             dragging_keyframe: false,
             keyframe_drag_offset: Vec2::ZERO,
             keyboard_active: false,
+            mask_editing: false,
+            mask_draft: Vec::new(),
         }
     }
 }
@@ -343,6 +355,7 @@ impl TracerApp {
                     keyframes: Vec::new(),
                     camera_motion: Vec::new(),
                     camera_motion_enabled: false,
+                    masks: Vec::new(),
                     path_smoothing: default_path_smoothing(),
                     trail_duration: default_trail_duration(),
                     trail_pace: default_trail_pace(),
@@ -1000,6 +1013,69 @@ impl TracerApp {
                     ui.separator();
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
+                        ui.heading("Masks");
+                        if !project.masks.is_empty()
+                            && ui
+                                .small_button(
+                                    egui::RichText::new("Clear")
+                                        .color(Color32::from_rgb(255, 151, 151)),
+                                )
+                                .clicked()
+                        {
+                            project.masks.clear();
+                        }
+                    });
+                    ui.label(
+                        "Outline an object the ball passes behind. The tracer is hidden inside the shape in the preview and the export.",
+                    );
+                    if self.canvas_zoom.mask_editing {
+                        ui.label(
+                            "Click the preview to add corners. Click the first point (or Finish) to close the shape.",
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    self.canvas_zoom.mask_draft.len() >= 3,
+                                    egui::Button::new("Finish"),
+                                )
+                                .clicked()
+                            {
+                                project.masks.push(MaskRegion {
+                                    points: std::mem::take(&mut self.canvas_zoom.mask_draft),
+                                });
+                                self.canvas_zoom.mask_editing = false;
+                            }
+                            if ui.button("Undo point").clicked() {
+                                self.canvas_zoom.mask_draft.pop();
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.canvas_zoom.mask_draft.clear();
+                                self.canvas_zoom.mask_editing = false;
+                            }
+                        });
+                    } else if ui.button("Draw mask").clicked() {
+                        self.canvas_zoom.mask_draft.clear();
+                        self.canvas_zoom.mask_editing = true;
+                    }
+                    let mut remove_mask = None;
+                    for index in 0..project.masks.len() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "Mask {} ({} points)",
+                                index + 1,
+                                project.masks[index].points.len()
+                            ));
+                            if ui.small_button("x").clicked() {
+                                remove_mask = Some(index);
+                            }
+                        });
+                    }
+                    if let Some(index) = remove_mask {
+                        project.masks.remove(index);
+                    }
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
                         ui.heading("Keyframes");
                         if ui
                             .small_button(
@@ -1458,7 +1534,9 @@ fn draw_video_editor(
                             }
                         }
 
-                        if canvas_response.drag_started_by(egui::PointerButton::Primary) {
+                        if canvas_response.drag_started_by(egui::PointerButton::Primary)
+                            && !zoom.mask_editing
+                        {
                             if let Some(pointer) = canvas_response.interact_pointer_pos() {
                                 let time = frame_time(*playhead_frame, project.frame_rate);
                                 if let Some(index) = keyframe_index_at_time(
@@ -1525,12 +1603,43 @@ fn draw_video_editor(
                 zoom.scale,
                 preview_data.2,
             );
+            draw_preview_masks(&painter, image_rect, texture.id(), project, zoom);
             if canvas_response.clicked_by(egui::PointerButton::Primary)
                 || canvas_response.drag_started_by(egui::PointerButton::Primary)
             {
                 canvas_response.request_focus();
             }
-            if !zoom.dragging_keyframe
+            if zoom.mask_editing
+                && !controls_hovered
+                && !canvas_response.dragged()
+                && canvas_response.clicked_by(egui::PointerButton::Primary)
+            {
+                if let Some(position) = canvas_response.interact_pointer_pos() {
+                    if image_rect.contains(position) {
+                        let point = (
+                            ((position.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0),
+                            ((position.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0),
+                        );
+                        let closes_shape = zoom.mask_draft.len() >= 3
+                            && zoom.mask_draft.first().is_some_and(|first| {
+                                Pos2::new(
+                                    image_rect.left() + first.0 * image_rect.width(),
+                                    image_rect.top() + first.1 * image_rect.height(),
+                                )
+                                .distance(position)
+                                    <= 12.0
+                            });
+                        if closes_shape {
+                            project.masks.push(MaskRegion {
+                                points: std::mem::take(&mut zoom.mask_draft),
+                            });
+                            zoom.mask_editing = false;
+                        } else {
+                            zoom.mask_draft.push(point);
+                        }
+                    }
+                }
+            } else if !zoom.dragging_keyframe
                 && !controls_hovered
                 && !canvas_response.dragged()
                 && canvas_response.clicked_by(egui::PointerButton::Primary)
@@ -2159,6 +2268,63 @@ fn draw_preview_tracer(
     }
     if let Some(point) = points.last() {
         painter.circle_filled(*point, width, color);
+    }
+}
+
+fn draw_preview_masks(
+    painter: &egui::Painter,
+    rect: Rect,
+    video_texture: egui::TextureId,
+    project: &Project,
+    zoom: &CanvasZoom,
+) {
+    let to_screen = |(x, y): (f32, f32)| {
+        Pos2::new(
+            rect.left() + x * rect.width(),
+            rect.top() + y * rect.height(),
+        )
+    };
+    // Repainting the video over the tracer makes the line pass behind the masked object.
+    for region in &project.masks {
+        let mut mesh = egui::Mesh::with_texture(video_texture);
+        for point in &region.points {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: to_screen(*point),
+                uv: Pos2::new(point.0, point.1),
+                color: Color32::WHITE,
+            });
+        }
+        for triangle in triangulate_polygon(&region.points) {
+            mesh.indices
+                .extend(triangle.iter().map(|&index| index as u32));
+        }
+        painter.add(egui::Shape::mesh(mesh));
+        if zoom.mask_editing {
+            let outline: Vec<Pos2> = region
+                .points
+                .iter()
+                .map(|point| to_screen(*point))
+                .collect();
+            painter.add(egui::Shape::closed_line(
+                outline,
+                Stroke::new(1.5_f32, Color32::from_rgb(120, 200, 255)),
+            ));
+        }
+    }
+    if zoom.mask_editing && !zoom.mask_draft.is_empty() {
+        let outline: Vec<Pos2> = zoom
+            .mask_draft
+            .iter()
+            .map(|point| to_screen(*point))
+            .collect();
+        painter.add(egui::Shape::line(
+            outline.clone(),
+            Stroke::new(2.0_f32, Color32::from_rgb(255, 214, 90)),
+        ));
+        for (index, point) in outline.iter().enumerate() {
+            let radius = if index == 0 { 6.0 } else { 3.5 };
+            painter.circle_filled(*point, radius, Color32::from_rgb(255, 214, 90));
+        }
     }
 }
 
@@ -3224,6 +3390,7 @@ fn render_overlay_frames(
     let rgb = project.tracer.color;
     let (line_width, glow) = scaled_tracer_dimensions(&project.tracer, height as f32);
     let mut last_report = Instant::now();
+    let mask_coverage = mask_coverage_image(width, height, &project.masks);
     for frame_index in 0..frames {
         let time = project.trim_in + frame_index as f32 / EXPORT_FPS as f32;
         let points = project_trail_points(project, time);
@@ -3248,6 +3415,9 @@ fn render_overlay_frames(
                 line_width.ceil() as i32,
                 line_color,
             );
+        }
+        if let Some(coverage) = &mask_coverage {
+            apply_mask_coverage(&mut image, coverage);
         }
         let frame_path = directory.join(format!("overlay_{frame_index:06}.png"));
         image
@@ -3281,6 +3451,97 @@ fn draw_thick_line(
         let x = start.0 + (end.0 - start.0) * amount;
         let y = start.1 + (end.1 - start.1) * amount;
         draw_filled_circle_mut(image, (x.round() as i32, y.round() as i32), radius, color);
+    }
+}
+
+fn polygon_area(points: &[(f32, f32)]) -> f32 {
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .map(|(a, b)| a.0 * b.1 - b.0 * a.1)
+        .sum::<f32>()
+        * 0.5
+}
+
+// Ear-clipping triangulation, so concave mask shapes can be filled with a mesh.
+fn triangulate_polygon(points: &[(f32, f32)]) -> Vec<[usize; 3]> {
+    if points.len() < 3 {
+        return Vec::new();
+    }
+    let mut remaining: Vec<usize> = (0..points.len()).collect();
+    if polygon_area(points) < 0.0 {
+        remaining.reverse();
+    }
+    let cross = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    let mut triangles = Vec::new();
+    while remaining.len() > 3 {
+        let count = remaining.len();
+        let ear = (0..count).find(|&i| {
+            let (a, b, c) = (
+                remaining[(i + count - 1) % count],
+                remaining[i],
+                remaining[(i + 1) % count],
+            );
+            if cross(points[a], points[b], points[c]) <= 0.0 {
+                return false;
+            }
+            !remaining.iter().any(|&other| {
+                other != a
+                    && other != b
+                    && other != c
+                    && cross(points[a], points[b], points[other]) >= 0.0
+                    && cross(points[b], points[c], points[other]) >= 0.0
+                    && cross(points[c], points[a], points[other]) >= 0.0
+            })
+        });
+        // Degenerate or self-intersecting shapes: clip an arbitrary vertex to guarantee progress.
+        let i = ear.unwrap_or(0);
+        triangles.push([
+            remaining[(i + count - 1) % count],
+            remaining[i],
+            remaining[(i + 1) % count],
+        ]);
+        remaining.remove(i);
+    }
+    triangles.push([remaining[0], remaining[1], remaining[2]]);
+    triangles
+}
+
+// Coverage mask (255 inside any region) with a one pixel soft edge.
+fn mask_coverage_image(width: u32, height: u32, masks: &[MaskRegion]) -> Option<GrayImage> {
+    let mut coverage = GrayImage::new(width, height);
+    let mut drawn = false;
+    for region in masks {
+        let mut polygon: Vec<imageproc::point::Point<i32>> = region
+            .points
+            .iter()
+            .map(|(x, y)| {
+                imageproc::point::Point::new(
+                    (x * width as f32).round() as i32,
+                    (y * height as f32).round() as i32,
+                )
+            })
+            .collect();
+        polygon.dedup();
+        while polygon.len() > 1 && polygon.first() == polygon.last() {
+            polygon.pop();
+        }
+        if polygon.len() >= 3 {
+            imageproc::drawing::draw_polygon_mut(&mut coverage, &polygon, Luma([255]));
+            drawn = true;
+        }
+    }
+    drawn.then(|| box_filter(&coverage, 1, 1))
+}
+
+fn apply_mask_coverage(image: &mut RgbaImage, coverage: &GrayImage) {
+    for (pixel, cover) in image.pixels_mut().zip(coverage.pixels()) {
+        let cover = cover.0[0] as u32;
+        if cover > 0 {
+            pixel.0[3] = (pixel.0[3] as u32 * (255 - cover) / 255) as u8;
+        }
     }
 }
 
@@ -3922,6 +4183,7 @@ mod tests {
             ],
             camera_motion: Vec::new(),
             camera_motion_enabled: false,
+            masks: Vec::new(),
             path_smoothing: 0.0,
             trail_duration: 1.0,
             trail_pace: 0.5,
@@ -3995,6 +4257,7 @@ mod tests {
                 },
             ],
             camera_motion_enabled: true,
+            masks: Vec::new(),
             path_smoothing: 0.5,
             trail_duration: 5.0,
             trail_pace: 0.5,
@@ -4064,6 +4327,7 @@ mod tests {
             ],
             camera_motion: Vec::new(),
             camera_motion_enabled: false,
+            masks: Vec::new(),
             path_smoothing: 0.8,
             trail_duration: 5.0,
             trail_pace: 0.5,
@@ -4099,6 +4363,7 @@ mod tests {
             }],
             camera_motion: Vec::new(),
             camera_motion_enabled: false,
+            masks: Vec::new(),
             path_smoothing: 0.5,
             trail_duration: 5.0,
             trail_pace: 0.5,
@@ -4263,6 +4528,57 @@ mod tests {
         }
         println!("played {frames} frames in {:?}", started.elapsed());
         assert!(frames >= 140, "only {frames} frames were delivered");
+    }
+
+    #[test]
+    fn concave_mask_shapes_triangulate_to_their_exact_area() {
+        let l_shape = [
+            (0.0, 0.0),
+            (0.6, 0.0),
+            (0.6, 0.2),
+            (0.2, 0.2),
+            (0.2, 0.6),
+            (0.0, 0.6),
+        ];
+        let triangles = super::triangulate_polygon(&l_shape);
+        assert_eq!(triangles.len(), 4);
+        let area: f32 = triangles
+            .iter()
+            .map(|t| super::polygon_area(&[l_shape[t[0]], l_shape[t[1]], l_shape[t[2]]]).abs())
+            .sum();
+        assert!((area - super::polygon_area(&l_shape).abs()).abs() < 1e-5);
+        let reversed: Vec<_> = l_shape.iter().rev().copied().collect();
+        assert_eq!(super::triangulate_polygon(&reversed).len(), 4);
+    }
+
+    #[test]
+    fn export_mask_hides_the_tracer_only_inside_the_shape() {
+        let masks = [super::MaskRegion {
+            points: vec![(0.4, 0.0), (0.6, 0.0), (0.6, 1.0), (0.4, 1.0)],
+        }];
+        let coverage = super::mask_coverage_image(100, 10, &masks).expect("mask coverage");
+        let mut image = RgbaImage::from_pixel(100, 10, Rgba([255, 0, 0, 255]));
+        super::apply_mask_coverage(&mut image, &coverage);
+        assert_eq!(image.get_pixel(10, 5).0[3], 255);
+        assert_eq!(image.get_pixel(90, 5).0[3], 255);
+        assert_eq!(image.get_pixel(50, 5).0[3], 0);
+        assert!(super::mask_coverage_image(100, 10, &[]).is_none());
+    }
+
+    #[test]
+    fn projects_saved_before_masks_load_without_any() {
+        let project: Project = serde_json::from_str(
+            r#"{
+                "video_path": "practice.mp4",
+                "duration": 5.0,
+                "trim_in": 0.0,
+                "trim_out": 5.0,
+                "keyframes": [],
+                "tracer": {"color": [255, 76, 48], "width": 5.0, "glow": 10.0}
+            }"#,
+        )
+        .expect("legacy project should remain loadable");
+        assert!(project.masks.is_empty());
     }
 
     #[test]
