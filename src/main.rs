@@ -177,6 +177,8 @@ struct Project {
     camera_motion_enabled: bool,
     #[serde(default)]
     masks: Vec<MaskRegion>,
+    #[serde(default)]
+    ball_colour: Option<[u8; 3]>,
     #[serde(default = "default_path_smoothing")]
     path_smoothing: f32,
     #[serde(default = "default_trail_duration")]
@@ -285,6 +287,7 @@ struct TracerApp {
     welcome_logo: egui::TextureHandle,
     tracer_glow: Option<egui::TextureHandle>,
     preview_size: [usize; 2],
+    preview_rgba: Vec<u8>,
     canvas_zoom: CanvasZoom,
     motion_receiver: Option<Receiver<MotionAnalysisMessage>>,
     motion_cancel: Option<Arc<AtomicBool>>,
@@ -312,6 +315,8 @@ struct CanvasZoom {
     mask_draft: Vec<(f32, f32)>,
     selected_mask: Option<usize>,
     dragging_vertex: Option<usize>,
+    picking_colour: bool,
+    pick_request: Option<(f32, f32)>,
 }
 
 impl Default for CanvasZoom {
@@ -326,6 +331,8 @@ impl Default for CanvasZoom {
             mask_draft: Vec::new(),
             selected_mask: None,
             dragging_vertex: None,
+            picking_colour: false,
+            pick_request: None,
         }
     }
 }
@@ -440,6 +447,7 @@ impl TracerApp {
             welcome_logo,
             tracer_glow: None,
             preview_size: [0, 0],
+            preview_rgba: Vec::new(),
             canvas_zoom: CanvasZoom::default(),
             motion_receiver: None,
             motion_cancel: None,
@@ -483,6 +491,7 @@ impl TracerApp {
                     camera_motion: Vec::new(),
                     camera_motion_enabled: false,
                     masks: Vec::new(),
+                    ball_colour: None,
                     path_smoothing: default_path_smoothing(),
                     trail_duration: default_trail_duration(),
                     trail_pace: default_trail_pace(),
@@ -1394,6 +1403,35 @@ impl TracerApp {
                             }
                         });
                     }
+                    ui.horizontal(|ui| {
+                            let picking = self.canvas_zoom.picking_colour;
+                            if ui
+                                .selectable_label(picking, "Pick ball colour")
+                                .on_hover_text(
+                                    "Click the ball in the preview so tracing can look for its colour. Zoom in first for a precise pick.",
+                                )
+                                .clicked()
+                            {
+                                self.canvas_zoom.picking_colour = !picking;
+                                self.canvas_zoom.mask_editing = false;
+                                self.canvas_zoom.selected_mask = None;
+                            }
+                        if let Some(colour) = project.ball_colour {
+                            let (rect, _) = ui.allocate_exact_size(
+                                Vec2::splat(18.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(
+                                rect,
+                                4.0,
+                                Color32::from_rgb(colour[0], colour[1], colour[2]),
+                            );
+                            if ui.small_button("x").on_hover_text("Forget the picked colour").clicked()
+                            {
+                                project.ball_colour = None;
+                            }
+                        }
+                    });
                     let mut remove_index = None;
                     egui::CollapsingHeader::new(format!("Keyframes ({})", project.keyframes.len()))
                         .id_salt("tracer_keyframes")
@@ -1467,6 +1505,23 @@ impl TracerApp {
                 false,
             );
         });
+        if let Some(point) = self.canvas_zoom.pick_request.take() {
+            self.status = match pick_ball_colour(&self.preview_rgba, self.preview_size, point) {
+                Some(colour) => {
+                    if let Some(project) = &mut self.project {
+                        project.ball_colour = Some(colour);
+                    }
+                    "Ball colour picked. Auto-trace will look for it.".to_owned()
+                }
+                None => {
+                    if let Some(project) = &mut self.project {
+                        project.ball_colour = None;
+                    }
+                    "That spot is white or grey, so colour matching is off. Auto-trace will use brightness instead."
+                        .to_owned()
+                }
+            };
+        }
         self.apply_editor_interaction(interaction);
     }
 
@@ -1600,6 +1655,7 @@ impl eframe::App for TracerApp {
                         ));
                     }
                     self.preview_size = frame.size;
+                    self.preview_rgba = frame.rgba;
                     self.status = format!("Preview: frame {} ({time:.3}s)", self.playhead_frame);
                 }
                 Err(error) => self.status = error,
@@ -1863,6 +1919,7 @@ fn draw_video_editor(
 
                         if canvas_response.drag_started_by(egui::PointerButton::Primary)
                             && !zoom.mask_editing
+                            && !zoom.picking_colour
                             && zoom.selected_mask.is_none()
                         {
                             if let Some(pointer) = canvas_response.interact_pointer_pos() {
@@ -1957,7 +2014,25 @@ fn draw_video_editor(
                     controls_hovered,
                 );
             }
-            if zoom.mask_editing
+            if zoom.picking_colour {
+                if canvas_response.hovered() && !controls_hovered {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+                if !controls_hovered
+                    && !canvas_response.dragged()
+                    && canvas_response.clicked_by(egui::PointerButton::Primary)
+                {
+                    if let Some(position) = canvas_response.interact_pointer_pos() {
+                        if image_rect.contains(position) {
+                            zoom.pick_request = Some((
+                                (position.x - image_rect.left()) / image_rect.width(),
+                                (position.y - image_rect.top()) / image_rect.height(),
+                            ));
+                            zoom.picking_colour = false;
+                        }
+                    }
+                }
+            } else if zoom.mask_editing
                 && !controls_hovered
                 && !canvas_response.dragged()
                 && canvas_response.clicked_by(egui::PointerButton::Primary)
@@ -3751,38 +3826,246 @@ fn find_ball(
     best.map(|(x, y, contrast, _)| (x, y, contrast))
 }
 
-// Follows the ball through the clip between the first and last tracer keyframes.
-// Returns the frame-by-frame positions in image pixels, `(time, x, y)`.
-fn follow_ball(
-    frames: impl FnMut() -> Result<Option<Vec<u8>>, String>,
-    anchors: &[(f32, f32, f32)],
+const BALL_COLOUR_RING: i32 = 9;
+const BALL_COLOUR_TOLERANCE: f32 = 60.0;
+const BALL_MIN_SATURATION: f32 = 40.0;
+
+struct TrackFrame {
+    gray: Vec<u8>,
+    rgb: Vec<u8>,
+}
+
+impl TrackFrame {
+    fn new(rgb: Vec<u8>) -> Self {
+        let gray = rgb
+            .chunks(3)
+            .map(|p| ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8) as u8)
+            .collect();
+        Self { gray, rgb }
+    }
+
+    // Colour difference from brightness (Cb, Cr), so shadows do not change a ball's colour much.
+    fn chroma(&self, index: usize) -> (f32, f32) {
+        let p = &self.rgb[index * 3..index * 3 + 3];
+        let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+        let y = 0.299 * r + 0.587 * g + 0.114 * b;
+        (b - y, r - y)
+    }
+
+    fn colour_match(&self, index: usize, reference: (f32, f32)) -> f32 {
+        let (cb, cr) = self.chroma(index);
+        let distance = ((cb - reference.0).powi(2) + (cr - reference.1).powi(2)).sqrt();
+        (1.0 - distance / BALL_COLOUR_TOLERANCE).max(0.0)
+    }
+}
+
+fn rgb_chroma(rgb: [u8; 3]) -> (f32, f32) {
+    let (r, g, b) = (rgb[0] as f32, rgb[1] as f32, rgb[2] as f32);
+    let y = 0.299 * r + 0.587 * g + 0.114 * b;
+    (b - y, r - y)
+}
+
+// Picks the most saturated 3x3 patch within a few pixels of a click on the preview
+// (normalized position) and returns its average colour, or None if it is white/grey.
+fn pick_ball_colour(rgba: &[u8], size: [usize; 2], point: (f32, f32)) -> Option<[u8; 3]> {
+    let (width, height) = (size[0], size[1]);
+    if width < 5 || height < 5 || rgba.len() < width * height * 4 {
+        return None;
+    }
+    let cx = (point.0 * width as f32).round() as i32;
+    let cy = (point.1 * height as f32).round() as i32;
+    let mut best: Option<(f32, [u8; 3])> = None;
+    for y in (cy - 4).max(1)..=(cy + 4).min(height as i32 - 2) {
+        for x in (cx - 4).max(1)..=(cx + 4).min(width as i32 - 2) {
+            let mut sum = [0_u32; 3];
+            for row in y - 1..=y + 1 {
+                for column in x - 1..=x + 1 {
+                    let index = (row as usize * width + column as usize) * 4;
+                    for channel in 0..3 {
+                        sum[channel] += rgba[index + channel] as u32;
+                    }
+                }
+            }
+            let colour = [(sum[0] / 9) as u8, (sum[1] / 9) as u8, (sum[2] / 9) as u8];
+            let (cb, cr) = rgb_chroma(colour);
+            let saturation = (cb * cb + cr * cr).sqrt();
+            if best.is_none_or(|(value, _)| saturation > value) {
+                best = Some((saturation, colour));
+            }
+        }
+    }
+    best.filter(|(saturation, _)| *saturation >= BALL_MIN_SATURATION)
+        .map(|(_, colour)| colour)
+}
+
+// Learns the ball's colour from the most saturated 3x3 patch around a clicked position.
+fn sample_ball_colour(
+    frame: &TrackFrame,
+    width: usize,
+    height: usize,
+    center: (f32, f32),
+) -> Option<(f32, f32)> {
+    let margin = 2_usize;
+    let mut best: Option<(f32, (f32, f32))> = None;
+    let (cx, cy) = (center.0.round() as i32, center.1.round() as i32);
+    for y in cy - 12..=cy + 12 {
+        for x in cx - 12..=cx + 12 {
+            if x < margin as i32
+                || y < margin as i32
+                || x >= (width - margin) as i32
+                || y >= (height - margin) as i32
+            {
+                continue;
+            }
+            let (mut cb, mut cr) = (0.0, 0.0);
+            for row in y - 1..=y + 1 {
+                for column in x - 1..=x + 1 {
+                    let (b, r) = frame.chroma(row as usize * width + column as usize);
+                    cb += b / 9.0;
+                    cr += r / 9.0;
+                }
+            }
+            let saturation = (cb * cb + cr * cr).sqrt();
+            if best.is_none_or(|(value, _)| saturation > value) {
+                best = Some((saturation, (cb, cr)));
+            }
+        }
+    }
+    best.filter(|(saturation, _)| *saturation >= BALL_MIN_SATURATION)
+        .map(|(_, colour)| colour)
+}
+
+// Finds the blob that best matches the ball's colour and stands out from its surroundings.
+fn find_coloured_ball(
+    frame: &TrackFrame,
+    width: usize,
+    height: usize,
+    center: (f32, f32),
+    radius: f32,
+    reference: (f32, f32),
+) -> Option<(f32, f32, f32)> {
+    let margin = BALL_COLOUR_RING as usize + 2;
+    if width <= margin * 2 || height <= margin * 2 {
+        return None;
+    }
+    let ring = BALL_COLOUR_RING;
+    let diagonal = (ring as f32 * 0.707).round() as i32;
+    let ring_offsets = [
+        (ring, 0),
+        (-ring, 0),
+        (0, ring),
+        (0, -ring),
+        (diagonal, diagonal),
+        (-diagonal, diagonal),
+        (diagonal, -diagonal),
+        (-diagonal, -diagonal),
+    ];
+    let x_min = (center.0 - radius).floor().max(margin as f32) as usize;
+    let x_max = (center.0 + radius).ceil().min((width - margin - 1) as f32) as usize;
+    let y_min = (center.1 - radius).floor().max(margin as f32) as usize;
+    let y_max = (center.1 + radius).ceil().min((height - margin - 1) as f32) as usize;
+    let sigma = (radius * 0.8).max(1.0);
+    let mut best: Option<(f32, f32, f32, f32)> = None;
+    for y in y_min..=y_max {
+        for x in x_min..=x_max {
+            let dx = x as f32 - center.0;
+            let dy = y as f32 - center.1;
+            let distance_sq = dx * dx + dy * dy;
+            if distance_sq > radius * radius {
+                continue;
+            }
+            if frame.colour_match(y * width + x, reference) < 0.15 {
+                continue;
+            }
+            let mut core = 0.0;
+            for row in y - 1..=y + 1 {
+                for column in x - 1..=x + 1 {
+                    core += frame.colour_match(row * width + column, reference) / 9.0;
+                }
+            }
+            if core < 0.35 {
+                continue;
+            }
+            let mut ring_max = 0.0_f32;
+            for (ox, oy) in ring_offsets {
+                let index = ((y as i32 + oy) as usize) * width + (x as i32 + ox) as usize;
+                ring_max = ring_max.max(frame.colour_match(index, reference));
+            }
+            let contrast = core - ring_max;
+            if contrast < 0.2 {
+                continue;
+            }
+            let score = contrast * (-distance_sq / (2.0 * sigma * sigma)).exp();
+            if best.is_none_or(|(_, _, _, best_score)| score > best_score) {
+                best = Some((x as f32, y as f32, contrast, score));
+            }
+        }
+    }
+    best.map(|(x, y, contrast, _)| (x, y, contrast))
+}
+
+#[derive(Clone, Copy)]
+struct TrackSettings {
     width: usize,
     height: usize,
     frame_rate: f32,
+    picked_colour: Option<(f32, f32)>,
+}
+
+// Follows the ball through the clip between the first and last tracer keyframes.
+// Frames are RGB24. Returns the frame-by-frame positions in image pixels, `(time, x, y)`.
+fn follow_ball(
+    frames: impl FnMut() -> Result<Option<Vec<u8>>, String>,
+    anchors: &[(f32, f32, f32)],
+    settings: TrackSettings,
     mut report_progress: impl FnMut(usize, usize),
     cancelled: &AtomicBool,
 ) -> Result<Vec<(f32, f32, f32)>, String> {
+    let TrackSettings {
+        width,
+        height,
+        frame_rate,
+        picked_colour,
+    } = settings;
     let mut read_frame = frames;
     let start = anchors[0].0;
     let end = anchors[anchors.len() - 1].0;
     let total = (((end - start) * frame_rate).round() as usize).max(1) + 1;
-    let max_radius = 0.06 * width.max(height) as f32;
+    let max_dimension = width.max(height) as f32;
+    let max_radius = 0.06 * max_dimension;
+    let anchor_frames: Vec<usize> = anchors
+        .iter()
+        .map(|anchor| ((anchor.0 - start) * frame_rate).round() as usize)
+        .collect();
     let mut positions = Vec::with_capacity(total);
     let mut offset = (0.0_f32, 0.0_f32);
-    let mut previous: Option<Vec<u8>> = None;
-    let Some(mut current) = read_frame()? else {
+    let mut colour = picked_colour;
+    let mut previous: Option<TrackFrame> = None;
+    let Some(first) = read_frame()? else {
         return Err("FFmpeg returned no frames for ball tracking.".to_owned());
     };
+    let mut current = TrackFrame::new(first);
     for index in 0..total {
         if cancelled.load(Ordering::Relaxed) {
             return Err("Ball tracing was cancelled.".to_owned());
         }
-        let next = if index + 1 < total {
-            read_frame()?
-        } else {
-            None
+        let next = match index + 1 < total {
+            true => read_frame()?.map(TrackFrame::new),
+            false => None,
         };
         let time = start + index as f32 / frame_rate;
+        for (anchor, anchor_frame) in anchors.iter().zip(&anchor_frames) {
+            if *anchor_frame == index && picked_colour.is_none() {
+                if let Some(sampled) =
+                    sample_ball_colour(&current, width, height, (anchor.1, anchor.2))
+                {
+                    colour = Some(match colour {
+                        Some(known) => ((known.0 + sampled.0) * 0.5, (known.1 + sampled.1) * 0.5),
+                        None => sampled,
+                    });
+                }
+            }
+        }
         let predicted = predict_ball_position(anchors, time);
         let nearest_anchor = anchors
             .iter()
@@ -3794,16 +4077,24 @@ fn follow_ball(
             predicted.0 + offset.0 * follow,
             predicted.1 + offset.1 * follow,
         );
-        let radius = 8.0 + max_radius * closeness;
-        let position = match find_ball(
-            previous.as_deref(),
-            &current,
-            next.as_deref(),
-            width,
-            height,
-            center,
-            radius,
-        ) {
+        // A known ball colour allows a much wider search, so a rough arc is good enough.
+        let found = colour
+            .and_then(|reference| {
+                let radius = 24.0 + 0.2 * max_dimension * closeness.max(0.35);
+                find_coloured_ball(&current, width, height, center, radius, reference)
+            })
+            .or_else(|| {
+                find_ball(
+                    previous.as_ref().map(|frame| frame.gray.as_slice()),
+                    &current.gray,
+                    next.as_ref().map(|frame| frame.gray.as_slice()),
+                    width,
+                    height,
+                    center,
+                    8.0 + max_radius * closeness,
+                )
+            });
+        let position = match found {
             Some((x, y, _)) => {
                 offset = (x - predicted.0, y - predicted.1);
                 (x, y)
@@ -3839,7 +4130,7 @@ fn trace_ball(
     let scale = (BALL_TRACK_MAX_DIMENSION as f32 / width.max(height) as f32).min(1.0);
     let analysis_width = (width as f32 * scale).round().max(1.0) as u32;
     let analysis_height = (height as f32 * scale).round().max(1.0) as u32;
-    let frame_size = (analysis_width * analysis_height) as usize;
+    let frame_size = (analysis_width * analysis_height * 3) as usize;
     let anchors: Vec<(f32, f32, f32)> = keyframes
         .iter()
         .map(|keyframe| {
@@ -3863,10 +4154,10 @@ fn trace_ball(
         .arg(format!("{duration:.6}"))
         .arg("-vf")
         .arg(format!(
-            "fps={},scale={analysis_width}:{analysis_height}:flags=area,format=gray",
+            "fps={},scale={analysis_width}:{analysis_height}:flags=area,format=rgb24",
             project.frame_rate
         ))
-        .args(["-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"])
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -3879,9 +4170,12 @@ fn trace_ball(
     let result = follow_ball(
         || read_raw_frame(&mut reader, frame_size).map_err(|error| error.to_string()),
         &anchors,
-        analysis_width as usize,
-        analysis_height as usize,
-        project.frame_rate,
+        TrackSettings {
+            width: analysis_width as usize,
+            height: analysis_height as usize,
+            frame_rate: project.frame_rate,
+            picked_colour: project.ball_colour.map(rgb_chroma),
+        },
         &mut report_progress,
         cancelled,
     );
@@ -4961,6 +5255,7 @@ mod tests {
             camera_motion: Vec::new(),
             camera_motion_enabled: false,
             masks: Vec::new(),
+            ball_colour: None,
             path_smoothing: 0.0,
             trail_duration: 1.0,
             trail_pace: 0.5,
@@ -5035,6 +5330,7 @@ mod tests {
             ],
             camera_motion_enabled: true,
             masks: Vec::new(),
+            ball_colour: None,
             path_smoothing: 0.5,
             trail_duration: 5.0,
             trail_pace: 0.5,
@@ -5105,6 +5401,7 @@ mod tests {
             camera_motion: Vec::new(),
             camera_motion_enabled: false,
             masks: Vec::new(),
+            ball_colour: None,
             path_smoothing: 0.8,
             trail_duration: 5.0,
             trail_pace: 0.5,
@@ -5141,6 +5438,7 @@ mod tests {
             camera_motion: Vec::new(),
             camera_motion_enabled: false,
             masks: Vec::new(),
+            ball_colour: None,
             path_smoothing: 0.5,
             trail_duration: 5.0,
             trail_pace: 0.5,
@@ -5586,11 +5884,12 @@ mod tests {
             }
             let (x, y) = truth(index);
             index += 1;
-            Ok(Some(frame_with_ball(
+            let gray = frame_with_ball(
                 width,
                 height,
                 Some((x.round() as usize, y.round() as usize)),
-            )))
+            );
+            Ok(Some(gray.iter().flat_map(|value| [*value; 3]).collect()))
         };
         let anchors = [
             (0.0, truth(0).0, truth(0).1),
@@ -5599,9 +5898,12 @@ mod tests {
         let positions = super::follow_ball(
             frames,
             &anchors,
-            width,
-            height,
-            frame_rate,
+            super::TrackSettings {
+                width,
+                height,
+                frame_rate,
+                picked_colour: None,
+            },
             |_, _| {},
             &std::sync::atomic::AtomicBool::new(false),
         )
@@ -5612,6 +5914,92 @@ mod tests {
             assert!(
                 (x - tx).abs() <= 1.5 && (y - ty).abs() <= 1.5,
                 "frame {index}"
+            );
+        }
+    }
+
+    fn rgb_frame(width: usize, height: usize, patches: &[(usize, usize, [u8; 3])]) -> Vec<u8> {
+        let mut frame: Vec<u8> = (0..width * height).flat_map(|_| [70_u8, 110, 70]).collect();
+        for (px, py, colour) in patches {
+            for y in py - 2..=py + 2 {
+                for x in px - 2..=px + 2 {
+                    frame[(y * width + x) * 3..(y * width + x) * 3 + 3].copy_from_slice(colour);
+                }
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn picking_a_colour_finds_saturated_balls_and_rejects_white() {
+        let (width, height) = (40_usize, 30_usize);
+        let mut rgba = vec![255_u8; width * height * 4];
+        for y in 10..=14 {
+            for x in 20..=24 {
+                let index = (y * width + x) * 4;
+                rgba[index..index + 3].copy_from_slice(&[250, 220, 20]);
+            }
+        }
+        let yellow = super::pick_ball_colour(&rgba, [width, height], (22.0 / 40.0, 12.0 / 30.0));
+        assert_eq!(yellow, Some([250, 220, 20]));
+        assert_eq!(
+            super::pick_ball_colour(&rgba, [width, height], (5.0 / 40.0, 25.0 / 30.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn follow_ball_uses_the_picked_colour_even_when_the_arc_is_far_off() {
+        let (width, height) = (300_usize, 160_usize);
+        let yellow = [250_u8, 220, 20];
+        // Only two anchors (a straight guess), but the ball really rises 40 px above that line,
+        // with a brighter white patch placed right on the guess to distract a brightness tracker.
+        let truth = |index: usize| {
+            let progress = index as f32 / 20.0;
+            (
+                30.0 + 240.0 * progress,
+                100.0 - 50.0 * (progress * std::f32::consts::PI).sin(),
+            )
+        };
+        let mut index = 0_usize;
+        let frames = || {
+            if index > 20 {
+                return Ok(None);
+            }
+            let (x, y) = truth(index);
+            let (gx, gy) = (30.0 + 240.0 * index as f32 / 20.0, 100.0);
+            index += 1;
+            Ok(Some(rgb_frame(
+                width,
+                height,
+                &[
+                    (gx.round() as usize, gy as usize, [255, 255, 255]),
+                    (x.round() as usize, y.round() as usize, yellow),
+                ],
+            )))
+        };
+        let anchors = [
+            (0.0, truth(0).0, truth(0).1),
+            (2.0, truth(20).0, truth(20).1),
+        ];
+        let positions = super::follow_ball(
+            frames,
+            &anchors,
+            super::TrackSettings {
+                width,
+                height,
+                frame_rate: 10.0,
+                picked_colour: Some(super::rgb_chroma(yellow)),
+            },
+            |_, _| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        for (index, (_, x, y)) in positions.iter().enumerate() {
+            let (tx, ty) = truth(index);
+            assert!(
+                (x - tx).abs() <= 2.0 && (y - ty).abs() <= 2.0,
+                "frame {index}: {x},{y}"
             );
         }
     }
