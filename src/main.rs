@@ -288,6 +288,10 @@ struct TracerApp {
     canvas_zoom: CanvasZoom,
     motion_receiver: Option<Receiver<MotionAnalysisMessage>>,
     motion_cancel: Option<Arc<AtomicBool>>,
+    trace_receiver: Option<Receiver<TraceMessage>>,
+    trace_cancel: Option<Arc<AtomicBool>>,
+    trace_progress: f32,
+    keyframes_before_trace: Option<Vec<Keyframe>>,
     motion_analysis_selection: Option<(PathBuf, f32, f32)>,
     motion_analysis_frames: usize,
     motion_analysis_total: usize,
@@ -372,6 +376,11 @@ enum MotionAnalysisMessage {
     Finished(Result<Vec<CameraMotionSample>, String>),
 }
 
+enum TraceMessage {
+    Progress(f32),
+    Finished(Result<Vec<Keyframe>, String>),
+}
+
 #[derive(Clone, Copy)]
 enum TimelineDrag {
     Playhead,
@@ -434,6 +443,10 @@ impl TracerApp {
             canvas_zoom: CanvasZoom::default(),
             motion_receiver: None,
             motion_cancel: None,
+            trace_receiver: None,
+            trace_cancel: None,
+            trace_progress: 0.0,
+            keyframes_before_trace: None,
             motion_analysis_selection: None,
             motion_analysis_frames: 0,
             motion_analysis_total: 0,
@@ -476,6 +489,7 @@ impl TracerApp {
                     tracer: TracerStyle::default(),
                 });
                 self.canvas_zoom = CanvasZoom::default();
+                self.keyframes_before_trace = None;
                 self.playhead_frame = 0;
                 self.is_playing = false;
                 self.screen = AppScreen::Trim;
@@ -610,6 +624,86 @@ impl TracerApp {
         }
     }
 
+    fn start_ball_trace(&mut self, ctx: &egui::Context) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        if self.trace_receiver.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let repaint_context = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("opentracer-ball-trace".to_owned())
+            .spawn(move || {
+                let progress_sender = sender.clone();
+                let progress_context = repaint_context.clone();
+                let result = trace_ball(&project, &worker_cancelled, |completed, total| {
+                    let _ = progress_sender.send(TraceMessage::Progress(
+                        completed as f32 / total.max(1) as f32,
+                    ));
+                    progress_context.request_repaint();
+                });
+                let _ = sender.send(TraceMessage::Finished(result));
+                repaint_context.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.trace_receiver = Some(receiver);
+                self.trace_cancel = Some(cancelled);
+                self.trace_progress = 0.0;
+                self.status = "Tracing the ball...".to_owned();
+            }
+            Err(error) => self.status = format!("Could not start ball tracing: {error}"),
+        }
+    }
+
+    fn cancel_ball_trace(&mut self) {
+        if let Some(cancelled) = self.trace_cancel.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        self.trace_receiver = None;
+    }
+
+    fn poll_ball_trace(&mut self) {
+        let mut finished = None;
+        if let Some(receiver) = &self.trace_receiver {
+            loop {
+                match receiver.try_recv() {
+                    Ok(TraceMessage::Progress(fraction)) => self.trace_progress = fraction,
+                    Ok(TraceMessage::Finished(result)) => {
+                        finished = Some(result);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        finished = Some(Err("Ball tracing stopped unexpectedly.".to_owned()));
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(result) = finished else {
+            return;
+        };
+        self.trace_receiver = None;
+        self.trace_cancel = None;
+        match result {
+            Ok(keyframes) => {
+                if let Some(project) = &mut self.project {
+                    self.keyframes_before_trace =
+                        Some(std::mem::replace(&mut project.keyframes, keyframes));
+                    self.status =
+                        "Ball traced. Check the path and fix any keyframes that strayed, or undo."
+                            .to_owned();
+                }
+            }
+            Err(error) => self.status = format!("Ball tracing failed: {error}"),
+        }
+    }
+
     fn cancel_motion_analysis(&mut self) {
         if let Some(cancelled) = self.motion_cancel.take() {
             cancelled.store(true, Ordering::Relaxed);
@@ -659,6 +753,7 @@ impl TracerApp {
                 self.playhead_frame = time_to_frame(project.trim_in, project.frame_rate);
                 self.project = Some(project);
                 self.canvas_zoom = CanvasZoom::default();
+                self.keyframes_before_trace = None;
                 self.is_playing = false;
                 self.screen = AppScreen::Trace;
                 self.request_preview();
@@ -1014,6 +1109,8 @@ impl TracerApp {
                 });
             });
 
+        let mut start_trace = false;
+        let mut cancel_trace = false;
         egui::SidePanel::right("trace_editor")
             .default_width(270.0)
             .frame(
@@ -1269,6 +1366,34 @@ impl TracerApp {
                     .on_hover_text(
                         "Click the preview to add a keyframe. Arrow keys browse frames; WASD nudges the tracer (10 preview pixels, 5 when zoomed past 400%, 1 with Shift).",
                     );
+                    if self.trace_receiver.is_some() {
+                        ui.add(egui::ProgressBar::new(self.trace_progress).text("Tracing ball"));
+                        if ui.button("Cancel").clicked() {
+                            cancel_trace = true;
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    project.keyframes.len() >= 2,
+                                    egui::Button::new("Auto-trace ball"),
+                                )
+                                .on_hover_text(
+                                    "Click the ball at its start, peak and end first. The app follows the ball between your first and last keyframes.",
+                                )
+                                .clicked()
+                            {
+                                start_trace = true;
+                            }
+                            if self.keyframes_before_trace.is_some()
+                                && ui.button("Undo trace").clicked()
+                            {
+                                if let Some(previous) = self.keyframes_before_trace.take() {
+                                    project.keyframes = previous;
+                                }
+                            }
+                        });
+                    }
                     let mut remove_index = None;
                     egui::CollapsingHeader::new(format!("Keyframes ({})", project.keyframes.len()))
                         .id_salt("tracer_keyframes")
@@ -1305,6 +1430,14 @@ impl TracerApp {
                     }
                 }
             });
+
+        if start_trace {
+            self.start_ball_trace(ctx);
+        }
+        if cancel_trace {
+            self.cancel_ball_trace();
+            self.status = "Ball tracing cancelled.".to_owned();
+        }
 
         let Some(project) = &mut self.project else {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -1474,6 +1607,7 @@ impl eframe::App for TracerApp {
         }
 
         self.handle_trace_keyboard(ctx);
+        self.poll_ball_trace();
 
         let mut finished_motion = None;
         if let Some(receiver) = &self.motion_receiver {
@@ -3486,6 +3620,300 @@ fn analyze_camera_motion(
     Ok(samples)
 }
 
+const BALL_TRACK_MAX_DIMENSION: u32 = 1280;
+const BALL_RING_RADIUS: i32 = 6;
+const BALL_MIN_CONTRAST: f32 = 10.0;
+
+fn lagrange_quadratic(points: [(f32, f32, f32); 3], time: f32) -> (f32, f32) {
+    let mut x = 0.0;
+    let mut y = 0.0;
+    for i in 0..3 {
+        let mut weight = 1.0;
+        for j in 0..3 {
+            if i != j {
+                weight *= (time - points[j].0) / (points[i].0 - points[j].0);
+            }
+        }
+        x += weight * points[i].1;
+        y += weight * points[i].2;
+    }
+    (x, y)
+}
+
+// Smooth ballistic-style arc through the user's anchors `(time, x, y)`: every segment blends
+// the parabolas through its neighbouring triples, so the arc passes exactly through each anchor.
+fn predict_ball_position(anchors: &[(f32, f32, f32)], time: f32) -> (f32, f32) {
+    let Some(first) = anchors.first() else {
+        return (0.0, 0.0);
+    };
+    let last = anchors[anchors.len() - 1];
+    if time <= first.0 || anchors.len() == 1 {
+        return (first.1, first.2);
+    }
+    if time >= last.0 {
+        return (last.1, last.2);
+    }
+    let segment = anchors.partition_point(|anchor| anchor.0 <= time) - 1;
+    let (a, b) = (anchors[segment], anchors[segment + 1]);
+    let weight = ((time - a.0) / (b.0 - a.0)).clamp(0.0, 1.0);
+    let linear = (a.1 + (b.1 - a.1) * weight, a.2 + (b.2 - a.2) * weight);
+    let before = (segment > 0).then(|| lagrange_quadratic([anchors[segment - 1], a, b], time));
+    let after = (segment + 2 < anchors.len())
+        .then(|| lagrange_quadratic([a, b, anchors[segment + 2]], time));
+    match (before, after) {
+        (Some(before), Some(after)) => (
+            before.0 * (1.0 - weight) + after.0 * weight,
+            before.1 * (1.0 - weight) + after.1 * weight,
+        ),
+        (Some(only), None) | (None, Some(only)) => only,
+        (None, None) => linear,
+    }
+}
+
+fn core_brightness(frame: &[u8], width: usize, x: usize, y: usize) -> f32 {
+    let mut sum = 0_u32;
+    for row in y - 1..=y + 1 {
+        for column in x - 1..=x + 1 {
+            sum += frame[row * width + column] as u32;
+        }
+    }
+    sum as f32 / 9.0
+}
+
+// Finds the most ball-like small blob near `center`: a spot that differs from its
+// surroundings and, when neighbouring frames are available, from the same spot a frame
+// before/after (so static bright things are ignored). Returns (x, y, contrast).
+fn find_ball(
+    previous: Option<&[u8]>,
+    current: &[u8],
+    next: Option<&[u8]>,
+    width: usize,
+    height: usize,
+    center: (f32, f32),
+    radius: f32,
+) -> Option<(f32, f32, f32)> {
+    let margin = BALL_RING_RADIUS as usize + 2;
+    if width <= margin * 2 || height <= margin * 2 {
+        return None;
+    }
+    let ring = BALL_RING_RADIUS;
+    let diagonal = (BALL_RING_RADIUS as f32 * 0.707).round() as i32;
+    let ring_offsets = [
+        (ring, 0),
+        (-ring, 0),
+        (0, ring),
+        (0, -ring),
+        (diagonal, diagonal),
+        (-diagonal, diagonal),
+        (diagonal, -diagonal),
+        (-diagonal, -diagonal),
+    ];
+    let x_min = ((center.0 - radius).floor().max(margin as f32)) as usize;
+    let x_max = ((center.0 + radius).ceil().min((width - margin - 1) as f32)) as usize;
+    let y_min = ((center.1 - radius).floor().max(margin as f32)) as usize;
+    let y_max = ((center.1 + radius).ceil().min((height - margin - 1) as f32)) as usize;
+    let sigma = (radius * 0.6).max(1.0);
+    let mut best: Option<(f32, f32, f32, f32)> = None;
+    for y in y_min..=y_max {
+        for x in x_min..=x_max {
+            let dx = x as f32 - center.0;
+            let dy = y as f32 - center.1;
+            let distance_sq = dx * dx + dy * dy;
+            if distance_sq > radius * radius {
+                continue;
+            }
+            let core = core_brightness(current, width, x, y);
+            let mut ring_max = f32::MIN;
+            let mut ring_min = f32::MAX;
+            for (ox, oy) in ring_offsets {
+                let value =
+                    current[((y as i32 + oy) as usize) * width + (x as i32 + ox) as usize] as f32;
+                ring_max = ring_max.max(value);
+                ring_min = ring_min.min(value);
+            }
+            let contrast = (core - ring_max).max((ring_min - core) * 0.7);
+            if contrast < BALL_MIN_CONTRAST {
+                continue;
+            }
+            let mut motion: Option<f32> = None;
+            for neighbour in [previous, next].into_iter().flatten() {
+                let difference = (core - core_brightness(neighbour, width, x, y)).abs();
+                motion = Some(motion.map_or(difference, |value| value.min(difference)));
+            }
+            let score = contrast
+                * (1.0 + motion.unwrap_or(0.0) / 32.0)
+                * (-distance_sq / (2.0 * sigma * sigma)).exp();
+            if best.is_none_or(|(_, _, _, best_score)| score > best_score) {
+                best = Some((x as f32, y as f32, contrast, score));
+            }
+        }
+    }
+    best.map(|(x, y, contrast, _)| (x, y, contrast))
+}
+
+// Follows the ball through the clip between the first and last tracer keyframes.
+// Returns the frame-by-frame positions in image pixels, `(time, x, y)`.
+fn follow_ball(
+    frames: impl FnMut() -> Result<Option<Vec<u8>>, String>,
+    anchors: &[(f32, f32, f32)],
+    width: usize,
+    height: usize,
+    frame_rate: f32,
+    mut report_progress: impl FnMut(usize, usize),
+    cancelled: &AtomicBool,
+) -> Result<Vec<(f32, f32, f32)>, String> {
+    let mut read_frame = frames;
+    let start = anchors[0].0;
+    let end = anchors[anchors.len() - 1].0;
+    let total = (((end - start) * frame_rate).round() as usize).max(1) + 1;
+    let max_radius = 0.06 * width.max(height) as f32;
+    let mut positions = Vec::with_capacity(total);
+    let mut offset = (0.0_f32, 0.0_f32);
+    let mut previous: Option<Vec<u8>> = None;
+    let Some(mut current) = read_frame()? else {
+        return Err("FFmpeg returned no frames for ball tracking.".to_owned());
+    };
+    for index in 0..total {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("Ball tracing was cancelled.".to_owned());
+        }
+        let next = if index + 1 < total {
+            read_frame()?
+        } else {
+            None
+        };
+        let time = start + index as f32 / frame_rate;
+        let predicted = predict_ball_position(anchors, time);
+        let nearest_anchor = anchors
+            .iter()
+            .map(|anchor| (anchor.0 - time).abs())
+            .fold(f32::MAX, f32::min);
+        let closeness = (nearest_anchor / 0.25).clamp(0.0, 1.0);
+        let follow = (nearest_anchor / 0.15).clamp(0.0, 1.0);
+        let center = (
+            predicted.0 + offset.0 * follow,
+            predicted.1 + offset.1 * follow,
+        );
+        let radius = 8.0 + max_radius * closeness;
+        let position = match find_ball(
+            previous.as_deref(),
+            &current,
+            next.as_deref(),
+            width,
+            height,
+            center,
+            radius,
+        ) {
+            Some((x, y, _)) => {
+                offset = (x - predicted.0, y - predicted.1);
+                (x, y)
+            }
+            None => center,
+        };
+        positions.push((time, position.0, position.1));
+        report_progress(index + 1, total);
+        previous = Some(current);
+        match next {
+            Some(frame) => current = frame,
+            None => break,
+        }
+    }
+    Ok(positions)
+}
+
+fn trace_ball(
+    project: &Project,
+    cancelled: &AtomicBool,
+    mut report_progress: impl FnMut(usize, usize),
+) -> Result<Vec<Keyframe>, String> {
+    let mut keyframes = project.keyframes.clone();
+    keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
+    if keyframes.len() < 2 || keyframes[keyframes.len() - 1].time - keyframes[0].time < 0.1 {
+        return Err("Add at least two tracer keyframes (ball start and end) first.".to_owned());
+    }
+    let width = probe_video_dimension(&project.video_path, "width")?;
+    let height = probe_video_dimension(&project.video_path, "height")?;
+    if width == 0 || height == 0 {
+        return Err("Could not read the video size.".to_owned());
+    }
+    let scale = (BALL_TRACK_MAX_DIMENSION as f32 / width.max(height) as f32).min(1.0);
+    let analysis_width = (width as f32 * scale).round().max(1.0) as u32;
+    let analysis_height = (height as f32 * scale).round().max(1.0) as u32;
+    let frame_size = (analysis_width * analysis_height) as usize;
+    let anchors: Vec<(f32, f32, f32)> = keyframes
+        .iter()
+        .map(|keyframe| {
+            let (offset_x, offset_y) = camera_motion_offset(project, keyframe.time);
+            (
+                keyframe.time,
+                (keyframe.x + offset_x) * analysis_width as f32,
+                (keyframe.y + offset_y) * analysis_height as f32,
+            )
+        })
+        .collect();
+    let start = anchors[0].0;
+    let duration = anchors[anchors.len() - 1].0 - start + 1.0 / project.frame_rate;
+
+    let mut child = multimedia_tool_command("ffmpeg")?
+        .args(["-v", "error", "-ss"])
+        .arg(format!("{start:.6}"))
+        .arg("-i")
+        .arg(&project.video_path)
+        .arg("-t")
+        .arg(format!("{duration:.6}"))
+        .arg("-vf")
+        .arg(format!(
+            "fps={},scale={analysis_width}:{analysis_height}:flags=area,format=gray",
+            project.frame_rate
+        ))
+        .args(["-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Could not start FFmpeg ball tracing: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Could not read FFmpeg ball-tracing frames.".to_owned())?;
+    let mut reader = BufReader::new(stdout);
+    let result = follow_ball(
+        || read_raw_frame(&mut reader, frame_size).map_err(|error| error.to_string()),
+        &anchors,
+        analysis_width as usize,
+        analysis_height as usize,
+        project.frame_rate,
+        &mut report_progress,
+        cancelled,
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    let positions = result?;
+
+    // Roughly ten keyframes per second keep the path editable; the user's own keyframes stay.
+    let step = ((project.frame_rate / 10.0).round() as usize).max(1);
+    let keep_clear = step as f32 / project.frame_rate * 0.5;
+    let mut traced = keyframes.clone();
+    for (index, (time, x, y)) in positions.iter().enumerate() {
+        if index % step != 0 {
+            continue;
+        }
+        if keyframes
+            .iter()
+            .any(|keyframe| (keyframe.time - time).abs() < keep_clear.max(0.5 / project.frame_rate))
+        {
+            continue;
+        }
+        let (offset_x, offset_y) = camera_motion_offset(project, *time);
+        traced.push(Keyframe {
+            time: *time,
+            x: (x / analysis_width as f32 - offset_x).clamp(0.0, 1.0),
+            y: (y / analysis_height as f32 - offset_y).clamp(0.0, 1.0),
+        });
+    }
+    traced.sort_by(|a, b| a.time.total_cmp(&b.time));
+    Ok(traced)
+}
+
 fn read_raw_frame(reader: &mut impl Read, frame_size: usize) -> std::io::Result<Option<Vec<u8>>> {
     let mut frame = vec![0_u8; frame_size];
     let first_read = reader.read(&mut frame[..1])?;
@@ -5073,5 +5501,118 @@ mod tests {
             Some(vec![0xFF, 0xD8, 0x03, 0xFF, 0xD9])
         );
         assert_eq!(read_mjpeg_frame(&mut reader, &mut buffered).unwrap(), None);
+    }
+
+    #[test]
+    fn predicted_ball_arc_passes_through_anchors_and_peaks_between_them() {
+        let anchors = [(0.0, 0.0, 100.0), (1.0, 50.0, 0.0), (2.0, 100.0, 100.0)];
+        for anchor in anchors {
+            let (x, y) = super::predict_ball_position(&anchors, anchor.0);
+            assert!((x - anchor.1).abs() < 1e-3 && (y - anchor.2).abs() < 1e-3);
+        }
+        let (x, y) = super::predict_ball_position(&anchors, 0.5);
+        assert!((x - 25.0).abs() < 1e-3);
+        assert!((y - 25.0).abs() < 1e-3, "parabola through start, peak, end");
+        assert_eq!(super::predict_ball_position(&anchors, 9.0), (100.0, 100.0));
+    }
+
+    fn frame_with_ball(width: usize, height: usize, ball: Option<(usize, usize)>) -> Vec<u8> {
+        let mut frame = vec![60_u8; width * height];
+        if let Some((bx, by)) = ball {
+            for y in by - 1..=by + 1 {
+                for x in bx - 1..=bx + 1 {
+                    frame[y * width + x] = 250;
+                }
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn find_ball_picks_the_moving_blob_near_the_prediction() {
+        let (width, height) = (200, 120);
+        let previous = frame_with_ball(width, height, Some((60, 50)));
+        let mut current = frame_with_ball(width, height, Some((70, 48)));
+        let next = frame_with_ball(width, height, Some((80, 46)));
+        // A static bright patch nearer the prediction must lose to the moving ball.
+        for y in 59..=61 {
+            for x in 68..=70 {
+                current[y * width + x] = 250;
+            }
+        }
+        let mut previous = previous;
+        let mut next = next;
+        for frame in [&mut previous, &mut next] {
+            for y in 59..=61 {
+                for x in 68..=70 {
+                    frame[y * width + x] = 250;
+                }
+            }
+        }
+        let (x, y, _) = super::find_ball(
+            Some(&previous),
+            &current,
+            Some(&next),
+            width,
+            height,
+            (72.0, 52.0),
+            15.0,
+        )
+        .expect("ball found");
+        assert!(
+            (x - 70.0).abs() <= 1.0 && (y - 48.0).abs() <= 1.0,
+            "{x},{y}"
+        );
+        let empty = frame_with_ball(width, height, None);
+        assert!(super::find_ball(None, &empty, None, width, height, (72.0, 52.0), 15.0).is_none());
+    }
+
+    #[test]
+    fn follow_ball_tracks_a_synthetic_flight_that_deviates_from_the_arc() {
+        let (width, height) = (200_usize, 120_usize);
+        let frame_rate = 10.0;
+        // The real ball drifts 8 px below the straight-line guess between the two anchors.
+        let truth = |index: usize| {
+            let progress = index as f32 / 20.0;
+            (
+                20.0 + 160.0 * progress,
+                60.0 + 8.0 * (progress * std::f32::consts::PI).sin(),
+            )
+        };
+        let mut index = 0_usize;
+        let frames = || {
+            if index > 20 {
+                return Ok(None);
+            }
+            let (x, y) = truth(index);
+            index += 1;
+            Ok(Some(frame_with_ball(
+                width,
+                height,
+                Some((x.round() as usize, y.round() as usize)),
+            )))
+        };
+        let anchors = [
+            (0.0, truth(0).0, truth(0).1),
+            (2.0, truth(20).0, truth(20).1),
+        ];
+        let positions = super::follow_ball(
+            frames,
+            &anchors,
+            width,
+            height,
+            frame_rate,
+            |_, _| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(positions.len(), 21);
+        for (index, (_, x, y)) in positions.iter().enumerate() {
+            let (tx, ty) = truth(index);
+            assert!(
+                (x - tx).abs() <= 1.5 && (y - ty).abs() <= 1.5,
+                "frame {index}"
+            );
+        }
     }
 }
