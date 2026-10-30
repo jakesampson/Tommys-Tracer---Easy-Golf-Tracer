@@ -1,11 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, BufWriter, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc, Mutex,
     },
@@ -13,7 +13,8 @@ use std::{
 };
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
-use image::{GrayImage, ImageFormat, Luma, Rgba, RgbaImage};
+use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
+use image::{GrayImage, Luma, Rgba, RgbaImage};
 use imageproc::drawing::{draw_filled_circle_mut, draw_line_segment_mut};
 use imageproc::filter::box_filter;
 use serde::{Deserialize, Serialize};
@@ -32,11 +33,20 @@ const TRACER_REFERENCE_HEIGHT: f32 = 1080.0;
 const TRACER_WIDTH_MAX: f32 = 16.0;
 const TRACER_GLOW_MAX: f32 = 24.0;
 const STYLE_SCALE_MAX: i32 = 10;
-const MOTION_ANALYSIS_FPS: u32 = 10;
+const MOTION_ANALYSIS_MAX_FPS: f32 = 30.0;
 const TRAIL_PACES: [f32; 3] = [0.25, 0.5, 1.0];
 
-fn expected_motion_analysis_samples(duration: f32) -> usize {
-    (duration * MOTION_ANALYSIS_FPS as f32).ceil().max(1.0) as usize
+// Analyzing at the source frame rate (up to 30 fps) keeps per-frame camera movement small.
+fn motion_analysis_fps(frame_rate: f32) -> f32 {
+    if frame_rate.is_finite() && frame_rate > 0.0 {
+        frame_rate.min(MOTION_ANALYSIS_MAX_FPS)
+    } else {
+        MOTION_ANALYSIS_MAX_FPS
+    }
+}
+
+fn expected_motion_analysis_samples(duration: f32, analysis_fps: f32) -> usize {
+    (duration * analysis_fps).ceil().max(1.0) as usize
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -266,13 +276,21 @@ fn default_glow_color() -> [u8; 3] {
 }
 
 fn style_scale_to_internal(value: i32, internal_max: f32) -> f32 {
-    value.clamp(1, STYLE_SCALE_MAX) as f32 / STYLE_SCALE_MAX as f32 * internal_max
+    style_scale_to_internal_from(1, value, internal_max)
+}
+
+fn style_scale_to_internal_from(min_scale: i32, value: i32, internal_max: f32) -> f32 {
+    value.clamp(min_scale, STYLE_SCALE_MAX) as f32 / STYLE_SCALE_MAX as f32 * internal_max
 }
 
 fn internal_to_style_scale(value: f32, internal_max: f32) -> i32 {
+    internal_to_style_scale_from(1, value, internal_max)
+}
+
+fn internal_to_style_scale_from(min_scale: i32, value: f32, internal_max: f32) -> i32 {
     ((value / internal_max).clamp(0.0, 1.0) * STYLE_SCALE_MAX as f32)
         .round()
-        .clamp(1.0, STYLE_SCALE_MAX as f32) as i32
+        .clamp(min_scale as f32, STYLE_SCALE_MAX as f32) as i32
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -366,7 +384,6 @@ impl Default for CanvasZoom {
 enum AppScreen {
     Welcome,
     Trim,
-    Stabilize,
     Trace,
 }
 
@@ -623,7 +640,10 @@ impl TracerApp {
         let (sender, receiver) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
-        let expected_frames = expected_motion_analysis_samples(project.trim_out - project.trim_in);
+        let expected_frames = expected_motion_analysis_samples(
+            project.trim_out - project.trim_in,
+            motion_analysis_fps(project.frame_rate),
+        );
         self.motion_analysis_selection = Some((
             project.video_path.clone(),
             project.trim_in,
@@ -649,7 +669,7 @@ impl TracerApp {
                 self.motion_analysis_frames = 0;
                 self.motion_analysis_total = expected_frames;
                 self.motion_analysis_progress = 0.0;
-                self.status = "Analyzing camera movement...".to_owned();
+                self.status = "Stabilising footage...".to_owned();
             }
             Err(error) => {
                 self.motion_analysis_selection = None;
@@ -934,6 +954,7 @@ impl TracerApp {
     }
 
     fn show_trim_screen(&mut self, ctx: &egui::Context) {
+        let mut continue_to_trace = false;
         egui::TopBottomPanel::top("trim_toolbar")
             .frame(
                 egui::Frame::new()
@@ -954,16 +975,16 @@ impl TracerApp {
                         self.open_video();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Continue to stabilization").clicked() {
-                            if self.is_playing {
-                                self.pause_playback();
-                            }
-                            self.screen = AppScreen::Stabilize;
+                        if ui.button("Continue to tracing").clicked() {
+                            continue_to_trace = true;
                         }
                     });
                 });
             });
-
+        if continue_to_trace {
+            self.continue_to_tracing(ctx);
+            return;
+        }
         let Some(project) = &mut self.project else {
             self.screen = AppScreen::Welcome;
             return;
@@ -1002,108 +1023,53 @@ impl TracerApp {
         self.apply_editor_interaction(interaction);
     }
 
-    fn show_stabilization_screen(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("stabilization_toolbar")
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(21, 32, 45, 245))
-                    .inner_margin(egui::Margin::symmetric(12, 8)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Back to trim").clicked() {
-                        self.cancel_motion_analysis();
-                        self.screen = AppScreen::Trim;
-                    }
-                    ui.separator();
-                    ui.label("2. Stabilize camera motion (experimental)");
-                });
-            });
+    fn continue_to_tracing(&mut self, ctx: &egui::Context) {
+        if self.is_playing {
+            self.pause_playback();
+        }
+        self.screen = AppScreen::Trace;
+        let needs_analysis = self
+            .project
+            .as_ref()
+            .is_some_and(|project| project.camera_motion.is_empty());
+        if let Some(project) = &self.project {
+            self.playhead_frame = time_to_frame(project.trim_in, project.frame_rate);
+        }
+        self.request_preview();
+        if needs_analysis {
+            self.analyze_camera_motion(ctx);
+        }
+    }
 
-        let Some(project) = &mut self.project else {
-            self.screen = AppScreen::Welcome;
+    fn show_stabilising_popup(&mut self, ctx: &egui::Context) {
+        if self.motion_receiver.is_none() {
             return;
-        };
-        let mut start_analysis = false;
-        let mut cancel_analysis = false;
-        let mut continue_to_trace = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        }
+        let mut skip = false;
+        egui::Modal::new(egui::Id::new("stabilising_footage")).show(ctx, |ui| {
+            ui.set_width(320.0);
             ui.vertical_centered(|ui| {
-                ui.add_space(30.0);
-                ui.heading("Keep the tracer anchored to the scene");
+                ui.heading("Stabilising footage");
                 ui.add_space(10.0);
-                ui.label(
-                    "Analyze the trimmed clip for small camera translations. \
-                     Motion compensation moves the tracer with the scene; \
-                     it does not crop or alter the source video.",
+                ui.add(
+                    egui::ProgressBar::new(self.motion_analysis_progress)
+                        .desired_width(280.0)
+                        .show_percentage(),
                 );
-                ui.add_space(20.0);
-                if self.motion_receiver.is_some() {
-                    ui.add(
-                        egui::ProgressBar::new(self.motion_analysis_progress)
-                            .desired_width(420.0)
-                            .text(format!(
-                                "Analyzed {} / {} frames ({:.0}%)",
-                                self.motion_analysis_frames,
-                                self.motion_analysis_total,
-                                self.motion_analysis_progress * 100.0
-                            )),
-                    );
-                    if ui.button("Cancel analysis").clicked() {
-                        cancel_analysis = true;
-                    }
-                } else if ui.button("Analyze camera motion").clicked() {
-                    start_analysis = true;
-                }
-                if !project.camera_motion.is_empty() {
-                    ui.add_space(14.0);
-                    ui.checkbox(
-                        &mut project.camera_motion_enabled,
-                        "Apply motion compensation",
-                    );
-                    ui.label(format!(
-                        "Analyzed {} motion samples. Turn compensation off at any time to compare.",
-                        project.camera_motion.len()
-                    ));
-                } else {
-                    ui.add_space(14.0);
-                    ui.label("You can skip this experiment and use the original footage.");
-                }
-                ui.add_space(24.0);
-                if ui.button("Continue to tracing").clicked() {
-                    continue_to_trace = Some(false);
-                }
-                if ui.button("Skip stabilization and continue").clicked() {
-                    continue_to_trace = Some(true);
+                ui.add_space(10.0);
+                if ui.button("Skip").clicked() {
+                    skip = true;
                 }
             });
         });
-        if start_analysis {
-            self.analyze_camera_motion(ctx);
-        }
-        if cancel_analysis {
+        if skip {
             self.cancel_motion_analysis();
-            self.status = "Camera-motion analysis cancelled.".to_owned();
-        }
-        if let Some(skip_stabilization) = continue_to_trace {
-            self.cancel_motion_analysis();
-            if skip_stabilization {
-                if let Some(project) = &mut self.project {
-                    project.camera_motion_enabled = false;
-                }
-            }
-            if self.is_playing {
-                self.pause_playback();
-            }
-            self.screen = AppScreen::Trace;
-            if let Some(project) = &self.project {
-                self.playhead_frame = time_to_frame(project.trim_in, project.frame_rate);
-            }
-            self.request_preview();
+            self.status = "Stabilisation skipped.".to_owned();
         }
     }
 
     fn show_trace_screen(&mut self, ctx: &egui::Context) {
+        let mut start_stabilise = false;
         egui::TopBottomPanel::top("trace_toolbar")
             .frame(
                 egui::Frame::new()
@@ -1119,7 +1085,7 @@ impl TracerApp {
                         self.screen = AppScreen::Trim;
                     }
                     ui.separator();
-                    ui.label("3. Trace ball flight");
+                    ui.label("2. Trace ball flight");
                     if ui.button("Open project").clicked() {
                         self.load_project();
                     }
@@ -1136,12 +1102,30 @@ impl TracerApp {
                         self.export_video(ctx);
                     }
                     if let Some(project) = &mut self.project {
-                        if !project.camera_motion.is_empty() {
+                        let has_motion = !project.camera_motion.is_empty();
+                        if has_motion {
                             ui.checkbox(&mut project.camera_motion_enabled, "Motion compensation");
+                        }
+                        if self.motion_receiver.is_none()
+                            && ui
+                                .button(if has_motion {
+                                    "Re-stabilise"
+                                } else {
+                                    "Stabilise"
+                                })
+                                .on_hover_text(
+                                    "Analyse camera movement so the tracer follows the scene.",
+                                )
+                                .clicked()
+                        {
+                            start_stabilise = true;
                         }
                     }
                 });
             });
+        if start_stabilise {
+            self.analyze_camera_motion(ctx);
+        }
 
         let mut start_trace = false;
         let mut cancel_trace = false;
@@ -1189,7 +1173,7 @@ impl TracerApp {
                         }
                     });
                     let mut glow_scale =
-                        internal_to_style_scale(project.tracer.glow, TRACER_GLOW_MAX);
+                        internal_to_style_scale_from(0, project.tracer.glow, TRACER_GLOW_MAX);
                     ui.horizontal(|ui| {
                         let slider_width = (ui.available_width()
                             - ui.spacing().interact_size.x
@@ -1198,14 +1182,14 @@ impl TracerApp {
                         if ui
                             .add_sized(
                                 [slider_width, ui.spacing().interact_size.y],
-                                egui::Slider::new(&mut glow_scale, 1..=STYLE_SCALE_MAX)
+                                egui::Slider::new(&mut glow_scale, 0..=STYLE_SCALE_MAX)
                                     .text("Glow"),
                             )
-                            .on_hover_text("Style scale: 1–10, where 10 is 100%.")
+                            .on_hover_text("Style scale: 0–10, where 0 turns the glow off and 10 is 100%.")
                             .changed()
                         {
                             project.tracer.glow =
-                                style_scale_to_internal(glow_scale, TRACER_GLOW_MAX);
+                                style_scale_to_internal_from(0, glow_scale, TRACER_GLOW_MAX);
                         }
                         let mut color = Color32::from_rgb(
                             project.tracer.glow_color[0],
@@ -1398,7 +1382,7 @@ impl TracerApp {
                     })
                     .response
                     .on_hover_text(
-                        "Click the preview to add a keyframe. Arrow keys browse frames; WASD nudges the tracer (10 preview pixels, 5 when zoomed past 400%, 1 with Shift).",
+                        "Click the preview to add a keyframe. Arrow keys browse frames; WASD nudges the tracer anywhere in the tracing screen (10 preview pixels, 5 when zoomed past 400%, 1 with Shift).",
                     );
                     if self.trace_receiver.is_some() {
                         ui.add(egui::ProgressBar::new(self.trace_progress).text("Tracing ball"));
@@ -1568,30 +1552,27 @@ impl TracerApp {
             return;
         }
 
-        let keyboard_editing_active = self.canvas_zoom.keyboard_active;
         let (horizontal, vertical, fine_nudge, step_backward, step_forward) =
             ctx.input_mut(|input| {
                 let modifiers = input.modifiers;
-                let horizontal =
-                    (if keyboard_editing_active && input.consume_key(modifiers, egui::Key::D) {
-                        1.0
-                    } else {
-                        0.0
-                    }) - (if keyboard_editing_active && input.consume_key(modifiers, egui::Key::A) {
-                        1.0
-                    } else {
-                        0.0
-                    });
-                let vertical =
-                    (if keyboard_editing_active && input.consume_key(modifiers, egui::Key::S) {
-                        1.0
-                    } else {
-                        0.0
-                    }) - (if keyboard_editing_active && input.consume_key(modifiers, egui::Key::W) {
-                        1.0
-                    } else {
-                        0.0
-                    });
+                let horizontal = (if input.consume_key(modifiers, egui::Key::D) {
+                    1.0
+                } else {
+                    0.0
+                }) - (if input.consume_key(modifiers, egui::Key::A) {
+                    1.0
+                } else {
+                    0.0
+                });
+                let vertical = (if input.consume_key(modifiers, egui::Key::S) {
+                    1.0
+                } else {
+                    0.0
+                }) - (if input.consume_key(modifiers, egui::Key::W) {
+                    1.0
+                } else {
+                    0.0
+                });
                 let step_backward = input.consume_key(modifiers, egui::Key::ArrowLeft);
                 let step_forward = input.consume_key(modifiers, egui::Key::ArrowRight);
                 (
@@ -1735,7 +1716,7 @@ impl eframe::App for TracerApp {
                             project.camera_motion_enabled = true;
                         }
                         self.motion_analysis_progress = 1.0;
-                        self.status = "Camera-motion analysis complete.".to_owned();
+                        self.status = "Footage stabilised.".to_owned();
                     } else {
                         self.status =
                             "Motion analysis finished, but the video trim changed; results were discarded."
@@ -1814,9 +1795,9 @@ impl eframe::App for TracerApp {
         match self.screen {
             AppScreen::Welcome => self.show_welcome(ctx),
             AppScreen::Trim => self.show_trim_screen(ctx),
-            AppScreen::Stabilize => self.show_stabilization_screen(ctx),
             AppScreen::Trace => self.show_trace_screen(ctx),
         }
+        self.show_stabilising_popup(ctx);
     }
 }
 
@@ -2972,6 +2953,21 @@ fn probe_video_info(path: &Path) -> Result<(f32, f32), String> {
     Ok((probe_duration(path)?, probe_frame_rate(path)?))
 }
 
+// An FFmpeg command that decodes on the GPU when possible. FFmpeg falls back to software
+// decoding on its own if the codec or hardware isn't supported.
+fn ffmpeg_decoding_command() -> Result<Command, String> {
+    let mut command = multimedia_tool_command("ffmpeg")?;
+    command.args([
+        "-hwaccel",
+        if cfg!(target_os = "macos") {
+            "videotoolbox"
+        } else {
+            "auto"
+        },
+    ]);
+    Ok(command)
+}
+
 fn multimedia_tool_command(tool: &str) -> Result<Command, String> {
     #[cfg(target_os = "macos")]
     let bundled = std::env::current_exe()
@@ -3568,11 +3564,8 @@ impl FrameFiller {
         cache: Arc<Mutex<FrameCache>>,
     ) -> Result<Self, String> {
         let dimension = PREVIEW_FRAME_MAX_DIMENSION;
-        let mut command = multimedia_tool_command("ffmpeg")?;
+        let mut command = ffmpeg_decoding_command()?;
         command.args(["-v", "error"]);
-        if cfg!(target_os = "macos") {
-            command.args(["-hwaccel", "videotoolbox"]);
-        }
         let mut child = command
             .arg("-ss")
             .arg(format!("{:.6}", frame_time(start, frame_rate)))
@@ -3658,7 +3651,7 @@ fn analyze_camera_motion(
     cancelled: &AtomicBool,
     mut report_progress: impl FnMut(usize, usize),
 ) -> Result<Vec<CameraMotionSample>, String> {
-    const ANALYSIS_MAX_DIMENSION: u32 = 320;
+    const ANALYSIS_MAX_DIMENSION: u32 = 480;
     let width = probe_video_dimension(&project.video_path, "width")?;
     let height = probe_video_dimension(&project.video_path, "height")?;
     if width == 0 || height == 0 || project.trim_out <= project.trim_in {
@@ -3669,9 +3662,10 @@ fn analyze_camera_motion(
     let analysis_height = (height as f32 * scale).round().max(1.0) as u32;
     let frame_size = (analysis_width * analysis_height) as usize;
     let duration = project.trim_out - project.trim_in;
-    let expected_frames = expected_motion_analysis_samples(duration);
+    let analysis_fps = motion_analysis_fps(project.frame_rate);
+    let expected_frames = expected_motion_analysis_samples(duration, analysis_fps);
 
-    let mut child = multimedia_tool_command("ffmpeg")?
+    let mut child = ffmpeg_decoding_command()?
         .args(["-v", "error", "-ss"])
         .arg(format!("{:.6}", project.trim_in))
         .arg("-i")
@@ -3680,7 +3674,7 @@ fn analyze_camera_motion(
         .arg(format!("{duration:.6}"))
         .arg("-vf")
         .arg(format!(
-            "fps={MOTION_ANALYSIS_FPS},scale={analysis_width}:{analysis_height}:flags=area,format=gray"
+            "fps={analysis_fps:.3},scale={analysis_width}:{analysis_height}:flags=area,format=gray"
         ))
         .args(["-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"])
         .stdout(Stdio::piped())
@@ -3713,6 +3707,7 @@ fn analyze_camera_motion(
     let mut previous_frame: Option<Vec<u8>> = None;
     let mut cumulative_x = 0.0_f32;
     let mut cumulative_y = 0.0_f32;
+    let mut last_delta = (0.0_f32, 0.0_f32);
     loop {
         if cancelled.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -3732,20 +3727,19 @@ fn analyze_camera_motion(
         };
 
         if let Some(previous) = &previous_frame {
+            // When a frame can't be matched (heavy blur), keep drifting along the recent motion.
             let (delta_x, delta_y) =
-                estimate_frame_translation(previous, &frame, analysis_width, analysis_height);
-            cumulative_x = (cumulative_x + delta_x as f32).clamp(
-                -(analysis_width as f32 * 0.15),
-                analysis_width as f32 * 0.15,
-            );
-            cumulative_y = (cumulative_y + delta_y as f32).clamp(
-                -(analysis_height as f32 * 0.15),
-                analysis_height as f32 * 0.15,
-            );
+                estimate_frame_translation(previous, &frame, analysis_width, analysis_height)
+                    .unwrap_or((last_delta.0 * 0.5, last_delta.1 * 0.5));
+            last_delta = (delta_x, delta_y);
+            cumulative_x =
+                (cumulative_x + delta_x).clamp(-(analysis_width as f32), analysis_width as f32);
+            cumulative_y =
+                (cumulative_y + delta_y).clamp(-(analysis_height as f32), analysis_height as f32);
         }
         let sample_index = samples.len();
         samples.push(CameraMotionSample {
-            time: project.trim_in + sample_index as f32 / MOTION_ANALYSIS_FPS as f32,
+            time: project.trim_in + sample_index as f32 / analysis_fps,
             x: cumulative_x / analysis_width as f32,
             y: cumulative_y / analysis_height as f32,
         });
@@ -4223,7 +4217,7 @@ fn trace_ball(
     let start = anchors[0].0;
     let duration = anchors[anchors.len() - 1].0 - start + 1.0 / project.frame_rate;
 
-    let mut child = multimedia_tool_command("ffmpeg")?
+    let mut child = ffmpeg_decoding_command()?
         .args(["-v", "error", "-ss"])
         .arg(format!("{start:.6}"))
         .arg("-i")
@@ -4296,59 +4290,173 @@ fn read_raw_frame(reader: &mut impl Read, frame_size: usize) -> std::io::Result<
     Ok(Some(frame))
 }
 
+fn downsample_half(source: &[u8], width: usize, height: usize) -> (Vec<u8>, usize, usize) {
+    let (out_width, out_height) = ((width / 2).max(1), (height / 2).max(1));
+    let mut output = vec![0_u8; out_width * out_height];
+    for y in 0..out_height {
+        for x in 0..out_width {
+            let (x0, y0) = ((x * 2).min(width - 1), (y * 2).min(height - 1));
+            let (x1, y1) = ((x0 + 1).min(width - 1), (y0 + 1).min(height - 1));
+            let sum = source[y0 * width + x0] as u32
+                + source[y0 * width + x1] as u32
+                + source[y1 * width + x0] as u32
+                + source[y1 * width + x1] as u32;
+            output[y * out_width + x] = ((sum + 2) / 4) as u8;
+        }
+    }
+    (output, out_width, out_height)
+}
+
+// Mean truncated pixel difference between `previous` and `current` shifted by (dx, dy),
+// measured over the area where both images overlap.
+fn shift_error(
+    previous: &[u8],
+    current: &[u8],
+    width: usize,
+    height: usize,
+    (dx, dy): (i32, i32),
+    step: usize,
+) -> Option<f32> {
+    const MAX_PIXEL_DIFFERENCE: u8 = 48;
+    let x_start = (-dx).max(0) as usize;
+    let x_end = (width as i32 - dx.max(0)).max(0) as usize;
+    let y_start = (-dy).max(0) as usize;
+    let y_end = (height as i32 - dy.max(0)).max(0) as usize;
+    if x_end <= x_start + width / 2 || y_end <= y_start + height / 2 {
+        return None;
+    }
+    let mut error = 0_u64;
+    let mut count = 0_u64;
+    for y in (y_start..y_end).step_by(step) {
+        let current_row = (y as i32 + dy) as usize * width;
+        for x in (x_start..x_end).step_by(step) {
+            let current_index = current_row + (x as i32 + dx) as usize;
+            error += previous[y * width + x]
+                .abs_diff(current[current_index])
+                .min(MAX_PIXEL_DIFFERENCE) as u64;
+            count += 1;
+        }
+    }
+    (count > 0).then(|| error as f32 / count as f32)
+}
+
+// Offset of the parabola's minimum through three equally spaced samples, within half a step.
+fn parabola_offset(before: f32, centre: f32, after: f32) -> f32 {
+    let curvature = before - 2.0 * centre + after;
+    if curvature <= f32::EPSILON {
+        0.0
+    } else {
+        (0.5 * (before - after) / curvature).clamp(-0.5, 0.5)
+    }
+}
+
+// Coarse-to-fine block matching: a wide search on a quarter-size image catches fast camera
+// moves, then two refinement passes and a sub-pixel fit recover precision.
 fn estimate_frame_translation(
     previous: &[u8],
     current: &[u8],
     width: u32,
     height: u32,
-) -> (i32, i32) {
-    const SEARCH_RADIUS: i32 = 12;
-    const SAMPLE_STEP: u32 = 4;
-    const MAX_PIXEL_DIFFERENCE: u8 = 48;
-    if width <= (SEARCH_RADIUS * 2) as u32 || height <= (SEARCH_RADIUS * 2) as u32 {
-        return (0, 0);
+) -> Option<(f32, f32)> {
+    const COARSE_RADIUS: i32 = 10;
+    const REFINE_RADIUS: i32 = 2;
+    const MIN_COARSE_CONTRAST: f32 = 0.75;
+    const MAX_ACCEPTED_ERROR: f32 = 28.0;
+    let (width, height) = (width as usize, height as usize);
+    if width < 64 || height < 64 {
+        return None;
     }
 
-    let mut best = (u64::MAX, 0, 0);
-    let mut second_best = u64::MAX;
-    for delta_y in -SEARCH_RADIUS..=SEARCH_RADIUS {
-        for delta_x in -SEARCH_RADIUS..=SEARCH_RADIUS {
-            let mut error = 0_u64;
-            let mut count = 0_u64;
-            let y_start = SEARCH_RADIUS as u32;
-            let y_end = height - SEARCH_RADIUS as u32;
-            let x_start = SEARCH_RADIUS as u32;
-            let x_end = width - SEARCH_RADIUS as u32;
-            for y in (y_start..y_end).step_by(SAMPLE_STEP as usize) {
-                for x in (x_start..x_end).step_by(SAMPLE_STEP as usize) {
-                    let previous_index = (y * width + x) as usize;
-                    let current_x = (x as i32 + delta_x) as u32;
-                    let current_y = (y as i32 + delta_y) as u32;
-                    let current_index = (current_y * width + current_x) as usize;
-                    error += previous[previous_index]
-                        .abs_diff(current[current_index])
-                        .min(MAX_PIXEL_DIFFERENCE) as u64;
-                    count += 1;
-                }
-            }
-            let score = error / count.max(1);
+    let mut pyramid = vec![(previous.to_vec(), current.to_vec(), width, height)];
+    for _ in 0..2 {
+        let (previous, current, level_width, level_height) = pyramid.last()?;
+        let (next_previous, next_width, next_height) =
+            downsample_half(previous, *level_width, *level_height);
+        let (next_current, _, _) = downsample_half(current, *level_width, *level_height);
+        pyramid.push((next_previous, next_current, next_width, next_height));
+    }
+
+    let (coarse_previous, coarse_current, coarse_width, coarse_height) = &pyramid[2];
+    let mut best = (f32::MAX, 0, 0);
+    let mut total = 0.0_f32;
+    let mut candidates = 0_u32;
+    for dy in -COARSE_RADIUS..=COARSE_RADIUS {
+        for dx in -COARSE_RADIUS..=COARSE_RADIUS {
+            let Some(score) = shift_error(
+                coarse_previous,
+                coarse_current,
+                *coarse_width,
+                *coarse_height,
+                (dx, dy),
+                1,
+            ) else {
+                continue;
+            };
+            total += score;
+            candidates += 1;
             if score < best.0 {
-                second_best = best.0;
-                best = (score, delta_x, delta_y);
-            } else if score < second_best {
-                second_best = score;
+                best = (score, dx, dy);
             }
         }
     }
-
-    if best.1.abs() == SEARCH_RADIUS
-        || best.2.abs() == SEARCH_RADIUS
-        || second_best.saturating_sub(best.0) < 1
-    {
-        (0, 0)
-    } else {
-        (best.1, best.2)
+    if candidates == 0 || total / candidates as f32 - best.0 < MIN_COARSE_CONTRAST {
+        return None;
     }
+
+    let mut shift = (best.1, best.2);
+    let mut final_score = best.0;
+    for level in [1_usize, 0] {
+        let (level_previous, level_current, level_width, level_height) = &pyramid[level];
+        let step = if level == 0 { 2 } else { 1 };
+        let centre = (shift.0 * 2, shift.1 * 2);
+        let mut level_best = (f32::MAX, centre.0, centre.1);
+        for dy in -REFINE_RADIUS..=REFINE_RADIUS {
+            for dx in -REFINE_RADIUS..=REFINE_RADIUS {
+                let candidate = (centre.0 + dx, centre.1 + dy);
+                if let Some(score) = shift_error(
+                    level_previous,
+                    level_current,
+                    *level_width,
+                    *level_height,
+                    candidate,
+                    step,
+                ) {
+                    if score < level_best.0 {
+                        level_best = (score, candidate.0, candidate.1);
+                    }
+                }
+            }
+        }
+        if level_best.0 == f32::MAX {
+            return None;
+        }
+        shift = (level_best.1, level_best.2);
+        final_score = level_best.0;
+    }
+    if final_score > MAX_ACCEPTED_ERROR {
+        return None;
+    }
+
+    let (base_previous, base_current, base_width, base_height) = &pyramid[0];
+    let score_at = |dx: i32, dy: i32| {
+        shift_error(
+            base_previous,
+            base_current,
+            *base_width,
+            *base_height,
+            (shift.0 + dx, shift.1 + dy),
+            2,
+        )
+    };
+    let fractional_x = match (score_at(-1, 0), score_at(0, 0), score_at(1, 0)) {
+        (Some(before), Some(centre), Some(after)) => parabola_offset(before, centre, after),
+        _ => 0.0,
+    };
+    let fractional_y = match (score_at(0, -1), score_at(0, 0), score_at(0, 1)) {
+        (Some(before), Some(centre), Some(after)) => parabola_offset(before, centre, after),
+        _ => 0.0,
+    };
+    Some((shift.0 as f32 + fractional_x, shift.1 as f32 + fractional_y))
 }
 
 fn camera_motion_offset(project: &Project, time: f32) -> (f32, f32) {
@@ -4472,28 +4580,64 @@ fn export_project(
     cleanup_result
 }
 
+// Returns the width or height as displayed: FFmpeg auto-rotates phone footage that carries
+// rotation metadata, so a quarter turn swaps the stored dimensions.
 fn probe_video_dimension(path: &Path, dimension: &str) -> Result<u32, String> {
+    let stdout = probe_video_stream(path)?;
+    let displayed = if parse_video_rotation(&stdout) % 180 == 90 {
+        if dimension == "width" {
+            "height"
+        } else {
+            "width"
+        }
+    } else {
+        dimension
+    };
+    parse_video_dimension(&stdout, displayed).ok_or_else(|| {
+        format!(
+            "ffprobe returned an invalid video {dimension}. Expected a positive integer; output was: {}",
+            stdout.trim()
+        )
+    })
+}
+
+// Counter-clockwise degrees (0, 90, 180 or 270) that must be applied to show the video upright.
+fn probe_video_rotation(path: &Path) -> Result<u32, String> {
+    Ok(parse_video_rotation(&probe_video_stream(path)?))
+}
+
+fn probe_video_stream(path: &Path) -> Result<String, String> {
     let output = multimedia_tool_command("ffprobe")?
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
-        .arg(format!("stream={dimension}"))
+        .arg("stream=width,height:stream_side_data=rotation:stream_tags=rotate")
         .args(["-of", "default=noprint_wrappers=1"])
         .arg(path)
         .output()
         .map_err(|error| format!("Could not start ffprobe: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "Could not read video {dimension}: {}. ffprobe output: {}",
+            "Could not read video details: {}. ffprobe output: {}",
             String::from_utf8_lossy(&output.stderr).trim(),
             String::from_utf8_lossy(&output.stdout).trim()
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_video_dimension(&stdout, dimension).ok_or_else(|| {
-        format!(
-            "ffprobe returned an invalid video {dimension}. Expected a positive integer; output was: {}",
-            stdout.trim()
-        )
-    })
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn parse_video_rotation(output: &str) -> u32 {
+    let value = |wanted: &str| {
+        output.lines().find_map(|line| {
+            let (key, value) = line.trim().split_once('=')?;
+            let key = key.trim().trim_start_matches("TAG:");
+            key.eq_ignore_ascii_case(wanted)
+                .then(|| value.trim().parse::<f32>().ok())
+                .flatten()
+        })
+    };
+    // The legacy `rotate` tag is clockwise, the display matrix counter-clockwise.
+    let degrees = value("rotation").or_else(|| value("rotate").map(|clockwise| -clockwise));
+    let quarter_turns = (degrees.unwrap_or(0.0) / 90.0).round() as i32;
+    (quarter_turns.rem_euclid(4) * 90) as u32
 }
 
 fn parse_video_dimension(output: &str, dimension: &str) -> Option<u32> {
@@ -4522,7 +4666,6 @@ fn render_overlay_frames(
     }
     let rgb = project.tracer.color;
     let (line_width, glow) = scaled_tracer_dimensions(&project.tracer, height as f32);
-    let mut last_report = Instant::now();
     let animated_masks = project
         .masks
         .iter()
@@ -4532,7 +4675,7 @@ fn render_overlay_frames(
     } else {
         mask_coverage_image(width, height, &project.masks, 0.0)
     };
-    for frame_index in 0..frames {
+    let render_frame = |frame_index: u32| -> Result<(), String> {
         let time = project.trim_in + frame_index as f32 / EXPORT_FPS as f32;
         let points = project_trail_points(project, time);
         let mut image = RgbaImage::new(width, height);
@@ -4564,15 +4707,60 @@ fn render_overlay_frames(
             apply_mask_coverage(&mut image, coverage);
         }
         let frame_path = directory.join(format!("overlay_{frame_index:06}.png"));
-        image
-            .save_with_format(frame_path, ImageFormat::Png)
+        let file = fs::File::create(&frame_path)
             .map_err(|error| format!("Could not render tracer frame: {error}"))?;
-        if last_report.elapsed() >= Duration::from_millis(100) || frame_index + 1 == frames {
-            let progress = (frame_index + 1) as f32 / frames as f32;
-            report_progress(0.02 + progress * 0.48, "Rendering tracer");
-            last_report = Instant::now();
+        // Frames are temporary, so favour encoding speed over file size.
+        image
+            .write_with_encoder(PngEncoder::new_with_quality(
+                BufWriter::new(file),
+                CompressionType::Fast,
+                PngFilterType::Sub,
+            ))
+            .map_err(|error| format!("Could not render tracer frame: {error}"))
+    };
+
+    let next_frame = AtomicU32::new(0);
+    let completed_frames = AtomicU32::new(0);
+    let failed = AtomicBool::new(false);
+    let failure = Mutex::new(None::<String>);
+    let worker_count = std::thread::available_parallelism()
+        .map_or(2, |count| count.get())
+        .clamp(1, 8)
+        .min(frames as usize);
+    let worker = || loop {
+        if failed.load(Ordering::Relaxed) {
+            break;
         }
+        let frame_index = next_frame.fetch_add(1, Ordering::Relaxed);
+        if frame_index >= frames {
+            break;
+        }
+        match render_frame(frame_index) {
+            Ok(()) => {
+                completed_frames.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                failure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert(error);
+                failed.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..worker_count).map(|_| scope.spawn(worker)).collect();
+        while !handles.iter().all(|handle| handle.is_finished()) {
+            let progress = completed_frames.load(Ordering::Relaxed) as f32 / frames as f32;
+            report_progress(0.02 + progress * 0.48, "Rendering tracer");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    if let Some(error) = failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        return Err(error);
     }
+    report_progress(0.50, "Rendering tracer");
     Ok(())
 }
 
@@ -4705,7 +4893,59 @@ fn render_glow_layer(
     if glow <= 0.0 || points.len() < 2 {
         return None;
     }
+    Some(glow_pixels(width, height, points, core_width, glow, rgb))
+}
 
+// Like `render_glow_layer`, but only covers the glow's bounding box so large frames stay cheap.
+// Returns the layer with the position of its top-left corner in the full frame.
+fn render_glow_region(
+    width: u32,
+    height: u32,
+    points: &[(f32, f32)],
+    core_width: f32,
+    glow: f32,
+    rgb: [u8; 3],
+) -> Option<(RgbaImage, i64, i64)> {
+    if glow <= 0.0 || points.len() < 2 {
+        return None;
+    }
+    let stroke_radius = (core_width + glow * 2.0).ceil().max(1.0) / 2.0;
+    let blur_extent = 3.0 * (glow * 0.32).round().max(1.0);
+    let margin = stroke_radius + blur_extent + 4.0;
+    let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+    let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+    for (x, y) in points {
+        min_x = min_x.min(*x);
+        min_y = min_y.min(*y);
+        max_x = max_x.max(*x);
+        max_y = max_y.max(*y);
+    }
+    let left = (min_x - margin).floor().clamp(0.0, width as f32) as u32;
+    let top = (min_y - margin).floor().clamp(0.0, height as f32) as u32;
+    let right = (max_x + margin).ceil().clamp(0.0, width as f32) as u32;
+    let bottom = (max_y + margin).ceil().clamp(0.0, height as f32) as u32;
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let local: Vec<(f32, f32)> = points
+        .iter()
+        .map(|(x, y)| (x - left as f32, y - top as f32))
+        .collect();
+    Some((
+        glow_pixels(right - left, bottom - top, &local, core_width, glow, rgb),
+        left as i64,
+        top as i64,
+    ))
+}
+
+fn glow_pixels(
+    width: u32,
+    height: u32,
+    points: &[(f32, f32)],
+    core_width: f32,
+    glow: f32,
+    rgb: [u8; 3],
+) -> RgbaImage {
     let mut mask = GrayImage::new(width, height);
     let stroke_width = (core_width + glow * 2.0).ceil().max(1.0) as u32;
     for segment in points.windows(2) {
@@ -4717,10 +4957,10 @@ fn render_glow_layer(
     let second_blur = box_filter(&first_blur, blur_radius, blur_radius);
     let blurred_mask = box_filter(&second_blur, blur_radius, blur_radius);
     let glow_strength = 0.28;
-    Some(RgbaImage::from_fn(width, height, |x, y| {
+    RgbaImage::from_fn(width, height, |x, y| {
         let alpha = (blurred_mask.get_pixel(x, y).0[0] as f32 * glow_strength).round() as u8;
         Rgba([rgb[0], rgb[1], rgb[2], alpha])
-    }))
+    })
 }
 
 fn draw_glow_mask_line(mask: &mut GrayImage, start: (f32, f32), end: (f32, f32), width: u32) {
@@ -4748,7 +4988,7 @@ fn draw_feathered_path(
     line_rgb: [u8; 3],
     glow_rgb: [u8; 3],
 ) {
-    if let Some(glow_layer) = render_glow_layer(
+    if let Some((glow_layer, offset_x, offset_y)) = render_glow_region(
         image.width(),
         image.height(),
         points,
@@ -4756,7 +4996,7 @@ fn draw_feathered_path(
         glow,
         glow_rgb,
     ) {
-        image::imageops::overlay(image, &glow_layer, 0, 0);
+        image::imageops::overlay(image, &glow_layer, offset_x, offset_y);
     }
     for segment in points.windows(2) {
         draw_thick_line(
@@ -4888,6 +5128,39 @@ fn catmull_rom_point(
     )
 }
 
+// Encoder argument sets in order of preference; GPU encoders first, software last.
+fn export_encoder_candidates() -> Vec<Vec<&'static str>> {
+    if cfg!(target_os = "macos") {
+        return vec![vec![
+            "-c:v",
+            "h264_videotoolbox",
+            "-b:v",
+            "10M",
+            "-allow_sw",
+            "1",
+        ]];
+    }
+    vec![
+        vec![
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-rc",
+            "vbr",
+            "-cq",
+            "21",
+            "-b:v",
+            "0",
+        ],
+        vec![
+            "-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", "20", "-qp_p", "22",
+        ],
+        vec!["-c:v", "h264_qsv", "-global_quality", "21"],
+        vec!["-c:v", "libx264", "-crf", "18", "-preset", "veryfast"],
+    ]
+}
+
 fn encode_export(
     project: &Project,
     output: &Path,
@@ -4895,11 +5168,50 @@ fn encode_export(
     duration: f32,
     report_progress: &mut impl FnMut(f32, &str),
 ) -> Result<(), String> {
+    let candidates = export_encoder_candidates();
+    let mut last_error = String::new();
+    for encoder in candidates {
+        match encode_export_with(
+            project,
+            output,
+            frame_dir,
+            duration,
+            &encoder,
+            report_progress,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+fn encode_export_with(
+    project: &Project,
+    output: &Path,
+    frame_dir: &Path,
+    duration: f32,
+    encoder: &[&str],
+    report_progress: &mut impl FnMut(f32, &str),
+) -> Result<(), String> {
+    let rotation = probe_video_rotation(&project.video_path)?;
+    // FFmpeg would copy the source's rotation flag onto the already-upright output, so the
+    // flag is cleared on input and the rotation is applied explicitly instead.
+    let upright = match rotation {
+        90 => "transpose=2",
+        180 => "hflip,vflip",
+        270 => "transpose=1",
+        _ => "null",
+    };
+    let filter = format!("[0:v]{upright}[base];[base][1:v]overlay=shortest=1:format=auto[outv]");
     let pattern = frame_dir.join("overlay_%06d.png");
     let mut command = multimedia_tool_command("ffmpeg")?;
+    command.args(["-y", "-v", "error", "-ss"]);
+    command.arg(format!("{:.3}", project.trim_in));
+    if rotation != 0 {
+        command.args(["-display_rotation", "0"]);
+    }
     command
-        .args(["-y", "-v", "error", "-ss"])
-        .arg(format!("{:.3}", project.trim_in))
         .arg("-i")
         .arg(&project.video_path)
         .arg("-t")
@@ -4908,18 +5220,8 @@ fn encode_export(
         .arg(EXPORT_FPS.to_string())
         .arg("-i")
         .arg(pattern)
-        .args([
-            "-filter_complex",
-            "[0:v][1:v]overlay=shortest=1:format=auto[outv]",
-            "-map",
-            "[outv]",
-            "-map",
-            "0:a?",
-        ]);
-    #[cfg(target_os = "macos")]
-    command.args(["-c:v", "h264_videotoolbox", "-b:v", "10M", "-allow_sw", "1"]);
-    #[cfg(not(target_os = "macos"))]
-    command.args(["-c:v", "libx264", "-crf", "18", "-preset", "medium"]);
+        .args(["-filter_complex", &filter, "-map", "[outv]", "-map", "0:a?"]);
+    command.args(encoder);
     let mut child = command
         .args([
             "-pix_fmt",
@@ -5048,11 +5350,12 @@ mod tests {
     use super::{
         camera_motion_offset, default_trail_duration, default_trail_pace, draw_feathered_path,
         ensure_keyframe_at_time, estimate_frame_translation, expected_motion_analysis_samples,
-        frame_time, internal_to_style_scale, keyframe_index_at_time, parse_frame_rate,
-        parse_video_dimension, playback_frame_deadline, position_on_path,
-        preview_tracer_zoom_scale, project_trail_points, read_mjpeg_frame,
-        scaled_tracer_dimensions, smooth_keyframes, snap_trim_time, step_frame,
-        style_scale_to_internal, time_to_frame, timeline_range, trace_nudge_pixels,
+        frame_time, internal_to_style_scale, internal_to_style_scale_from, keyframe_index_at_time,
+        motion_analysis_fps, parse_frame_rate, parse_video_dimension, parse_video_rotation,
+        playback_frame_deadline, position_on_path, preview_tracer_zoom_scale, project_trail_points,
+        read_mjpeg_frame, render_glow_layer, render_glow_region, scaled_tracer_dimensions,
+        smooth_keyframes, snap_trim_time, step_frame, style_scale_to_internal,
+        style_scale_to_internal_from, time_to_frame, timeline_range, trace_nudge_pixels,
         trail_cutoff_time, trail_pace_index, trail_points, zoom_pan_for_cursor,
         zoomed_preview_rect, CameraMotionSample, FrameCache, Keyframe, Project, TracerStyle,
         MAX_CANVAS_ZOOM, TRACER_GLOW_MAX, TRACER_WIDTH_MAX,
@@ -5084,6 +5387,13 @@ mod tests {
     }
 
     #[test]
+    fn zero_glow_renders_no_glow_layer() {
+        let points = [(10.0, 10.0), (60.0, 40.0)];
+        assert!(render_glow_layer(100, 80, &points, 4.0, 0.0, [255, 0, 0]).is_none());
+        assert!(render_glow_region(100, 80, &points, 4.0, 0.0, [255, 0, 0]).is_none());
+    }
+
+    #[test]
     fn tracer_style_controls_map_whole_number_scale_to_internal_values() {
         assert_eq!(style_scale_to_internal(1, TRACER_WIDTH_MAX), 1.6);
         assert_eq!(
@@ -5099,6 +5409,9 @@ mod tests {
         assert_eq!(internal_to_style_scale(5.0, TRACER_WIDTH_MAX), 3);
         assert_eq!(internal_to_style_scale(10.0, TRACER_GLOW_MAX), 4);
         assert_eq!(internal_to_style_scale(0.5, 1.0), 5);
+        assert_eq!(style_scale_to_internal_from(0, 0, TRACER_GLOW_MAX), 0.0);
+        assert_eq!(internal_to_style_scale_from(0, 0.0, TRACER_GLOW_MAX), 0);
+        assert_eq!(internal_to_style_scale(0.0, TRACER_GLOW_MAX), 1);
     }
 
     #[test]
@@ -5197,6 +5510,16 @@ mod tests {
         assert!(four_x_size < 1.0);
         assert!(eight_x_size < four_x_size);
         assert!(eight_x_size > 0.7);
+    }
+
+    #[test]
+    fn rotation_metadata_is_normalised_and_swaps_displayed_dimensions() {
+        assert_eq!(parse_video_rotation("width=1920\nrotation=-90\n"), 270);
+        assert_eq!(parse_video_rotation("width=1920\nrotation=90\n"), 90);
+        assert_eq!(parse_video_rotation("width=1920\nrotation=-180\n"), 180);
+        assert_eq!(parse_video_rotation("width=1920\nTAG:rotate=90\n"), 270);
+        assert_eq!(parse_video_rotation("width=1920\nTAG:rotate=270\n"), 90);
+        assert_eq!(parse_video_rotation("width=1920\nheight=1080\n"), 0);
     }
 
     #[test]
@@ -5354,31 +5677,82 @@ mod tests {
         assert!(half_speed_cutoff.0 < full_speed_cutoff.0);
     }
 
-    #[test]
-    fn camera_motion_estimator_detects_small_scene_translations() {
-        let (width, height) = (128_u32, 96_u32);
-        let mut previous = vec![0_u8; (width * height) as usize];
+    // Smooth blobs give the matcher realistic, non-repeating texture at any sub-pixel offset.
+    fn blob_scene(width: u32, height: u32, shift_x: f32, shift_y: f32) -> Vec<u8> {
+        const BLOBS: [(f32, f32, f32, f32); 7] = [
+            (0.20, 0.25, 0.10, 90.0),
+            (0.70, 0.30, 0.07, -70.0),
+            (0.45, 0.60, 0.12, 110.0),
+            (0.80, 0.75, 0.06, -90.0),
+            (0.15, 0.80, 0.08, 80.0),
+            (0.55, 0.15, 0.05, 100.0),
+            (0.90, 0.50, 0.09, -60.0),
+        ];
+        let mut pixels = vec![0_u8; (width * height) as usize];
         for y in 0..height {
             for x in 0..width {
-                previous[(y * width + x) as usize] = ((x * 73 + y * 29 + x * y * 17) % 251) as u8;
+                let (sx, sy) = (x as f32 - shift_x, y as f32 - shift_y);
+                let mut value = 128.0;
+                for (cx, cy, radius, amplitude) in BLOBS {
+                    let dx = sx / width as f32 - cx;
+                    let dy = sy / width as f32 - cy;
+                    value += amplitude * (-(dx * dx + dy * dy) / (radius * radius)).exp();
+                }
+                pixels[(y * width + x) as usize] = value.clamp(0.0, 255.0) as u8;
             }
         }
-        let mut current = vec![0_u8; previous.len()];
-        for y in 0..height - 2 {
-            for x in 0..width - 3 {
-                current[(y * width + x + 3) as usize] = previous[((y + 2) * width + x) as usize];
-            }
-        }
-        assert_eq!(
-            estimate_frame_translation(&previous, &current, width, height),
-            (3, -2)
+        pixels
+    }
+
+    #[test]
+    fn camera_motion_estimator_detects_small_scene_translations() {
+        let (width, height) = (240_u32, 160_u32);
+        let previous = blob_scene(width, height, 0.0, 0.0);
+        let current = blob_scene(width, height, 3.0, -2.0);
+        let (x, y) = estimate_frame_translation(&previous, &current, width, height)
+            .expect("textured frames should match");
+        assert!((x - 3.0).abs() < 0.6 && (y + 2.0).abs() < 0.6, "({x}, {y})");
+    }
+
+    #[test]
+    fn camera_motion_estimator_follows_fast_camera_moves() {
+        let (width, height) = (240_u32, 160_u32);
+        let previous = blob_scene(width, height, 0.0, 0.0);
+        let current = blob_scene(width, height, -22.0, 15.0);
+        let (x, y) = estimate_frame_translation(&previous, &current, width, height)
+            .expect("fast moves should still match");
+        assert!(
+            (x + 22.0).abs() < 1.5 && (y - 15.0).abs() < 1.5,
+            "({x}, {y})"
         );
     }
 
     #[test]
-    fn ten_fps_motion_analysis_reports_samples_for_the_selected_duration() {
-        assert_eq!(expected_motion_analysis_samples(23.56), 236);
-        assert_eq!(expected_motion_analysis_samples(20.0), 200);
+    fn camera_motion_estimator_rejects_featureless_frames() {
+        let flat = vec![100_u8; 240 * 160];
+        assert!(estimate_frame_translation(&flat, &flat, 240, 160).is_none());
+    }
+
+    #[test]
+    fn motion_analysis_reports_samples_for_the_selected_duration() {
+        assert_eq!(expected_motion_analysis_samples(7.0, 30.0), 210);
+        assert_eq!(expected_motion_analysis_samples(20.0, 24.0), 480);
+        assert_eq!(motion_analysis_fps(60.0), 30.0);
+        assert_eq!(motion_analysis_fps(24.0), 24.0);
+    }
+
+    #[test]
+    fn cropped_glow_region_matches_the_full_frame_glow() {
+        let points = [(60.0, 50.0), (90.0, 40.0), (130.0, 70.0)];
+        let full =
+            render_glow_layer(200, 120, &points, 4.0, 10.0, [255, 0, 0]).expect("glow layer");
+        let (region, left, top) =
+            render_glow_region(200, 120, &points, 4.0, 10.0, [255, 0, 0]).expect("glow region");
+        assert!(region.width() < 200 && region.height() < 120);
+        let mut composed = RgbaImage::new(200, 120);
+        image::imageops::overlay(&mut composed, &region, left, top);
+        let alpha = |image: &RgbaImage| image.pixels().map(|pixel| pixel.0[3]).collect::<Vec<_>>();
+        assert_eq!(alpha(&composed), alpha(&full));
     }
 
     #[test]
