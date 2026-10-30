@@ -5066,6 +5066,10 @@ fn trail_points(
         }
     }
     if points.is_empty() {
+        // The trail has fully caught up with the final keyframe, so the end point goes too.
+        if window_start >= keys[keys.len() - 1].time && time > window_start {
+            return points;
+        }
         let (x, y) = position_on_path(keys, time);
         points.push((x, y));
     }
@@ -5581,6 +5585,24 @@ mod tests {
         let (x, y) = points.last().copied().expect("interpolated point");
         assert!((x - 0.5).abs() < 0.0001);
         assert!((y - 0.5625).abs() < 0.0001);
+    }
+
+    #[test]
+    fn final_point_disappears_once_the_trail_has_fully_faded() {
+        let keys = [
+            Keyframe {
+                time: 0.0,
+                x: 0.1,
+                y: 0.2,
+            },
+            Keyframe {
+                time: 1.0,
+                x: 0.9,
+                y: 0.8,
+            },
+        ];
+        assert!(!trail_points(&keys, 1.5, 0.0, 1.0, 1.0).is_empty());
+        assert!(trail_points(&keys, 2.5, 0.0, 1.0, 1.0).is_empty());
     }
 
     #[test]
