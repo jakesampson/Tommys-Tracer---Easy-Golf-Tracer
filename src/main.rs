@@ -3951,7 +3951,7 @@ fn pick_ball_colour(rgba: &[u8], size: [usize; 2], point: (f32, f32)) -> Option<
         for x in (cx - 4).max(1)..=(cx + 4).min(width as i32 - 2) {
             let mut sum = [0_u32; 3];
             for row in y - 1..=y + 1 {
-                for column in x - 1..=x + 1 {https://www.shopify.com/au/tools/ai-store-builder/5c769940-ab32-43f7-8386-9a0f40f3b509/loading?storeDescription=A%20beef%20taloe%20hippy%20byron%20bay%20website
+                for column in x - 1..=x + 1 {
                     let index = (row as usize * width + column as usize) * 4;
                     for channel in 0..3 {
                         sum[channel] += rgba[index + channel] as u32;
