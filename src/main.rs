@@ -33,10 +33,10 @@ const TRACER_REFERENCE_HEIGHT: f32 = 1080.0;
 const TRACER_WIDTH_MAX: f32 = 16.0;
 const TRACER_GLOW_MAX: f32 = 24.0;
 const STYLE_SCALE_MAX: i32 = 10;
-const MOTION_ANALYSIS_MAX_FPS: f32 = 30.0;
+const MOTION_ANALYSIS_MAX_FPS: f32 = 120.0;
 const TRAIL_PACES: [f32; 3] = [0.25, 0.5, 1.0];
 
-// Analyzing at the source frame rate (up to 30 fps) keeps per-frame camera movement small.
+// Analyzing at the source frame rate (up to 120 fps) keeps per-frame camera movement small.
 fn motion_analysis_fps(frame_rate: f32) -> f32 {
     if frame_rate.is_finite() && frame_rate > 0.0 {
         frame_rate.min(MOTION_ANALYSIS_MAX_FPS)
@@ -3651,7 +3651,7 @@ fn analyze_camera_motion(
     cancelled: &AtomicBool,
     mut report_progress: impl FnMut(usize, usize),
 ) -> Result<Vec<CameraMotionSample>, String> {
-    const ANALYSIS_MAX_DIMENSION: u32 = 480;
+    const ANALYSIS_MAX_DIMENSION: u32 = 1280;
     let width = probe_video_dimension(&project.video_path, "width")?;
     let height = probe_video_dimension(&project.video_path, "height")?;
     if width == 0 || height == 0 || project.trim_out <= project.trim_in {
@@ -3730,7 +3730,7 @@ fn analyze_camera_motion(
             // When a frame can't be matched (heavy blur), keep drifting along the recent motion.
             let (delta_x, delta_y) =
                 estimate_frame_translation(previous, &frame, analysis_width, analysis_height)
-                    .unwrap_or((last_delta.0 * 0.5, last_delta.1 * 0.5));
+                    .unwrap_or((last_delta.0 * 0.9, last_delta.1 * 0.9));
             last_delta = (delta_x, delta_y);
             cumulative_x =
                 (cumulative_x + delta_x).clamp(-(analysis_width as f32), analysis_width as f32);
@@ -3951,7 +3951,7 @@ fn pick_ball_colour(rgba: &[u8], size: [usize; 2], point: (f32, f32)) -> Option<
         for x in (cx - 4).max(1)..=(cx + 4).min(width as i32 - 2) {
             let mut sum = [0_u32; 3];
             for row in y - 1..=y + 1 {
-                for column in x - 1..=x + 1 {
+                for column in x - 1..=x + 1 {https://www.shopify.com/au/tools/ai-store-builder/5c769940-ab32-43f7-8386-9a0f40f3b509/loading?storeDescription=A%20beef%20taloe%20hippy%20byron%20bay%20website
                     let index = (row as usize * width + column as usize) * 4;
                     for channel in 0..3 {
                         sum[channel] += rgba[index + channel] as u32;
@@ -4358,17 +4358,18 @@ fn estimate_frame_translation(
     width: u32,
     height: u32,
 ) -> Option<(f32, f32)> {
-    const COARSE_RADIUS: i32 = 10;
+    const COARSE_RADIUS: i32 = 12;
     const REFINE_RADIUS: i32 = 2;
-    const MIN_COARSE_CONTRAST: f32 = 0.75;
-    const MAX_ACCEPTED_ERROR: f32 = 28.0;
+    const PYRAMID_LEVELS: usize = 3;
+    const MIN_COARSE_CONTRAST: f32 = 0.3;
+    const MAX_ACCEPTED_ERROR: f32 = 40.0;
     let (width, height) = (width as usize, height as usize);
     if width < 64 || height < 64 {
         return None;
     }
 
     let mut pyramid = vec![(previous.to_vec(), current.to_vec(), width, height)];
-    for _ in 0..2 {
+    for _ in 0..PYRAMID_LEVELS {
         let (previous, current, level_width, level_height) = pyramid.last()?;
         let (next_previous, next_width, next_height) =
             downsample_half(previous, *level_width, *level_height);
@@ -4376,7 +4377,7 @@ fn estimate_frame_translation(
         pyramid.push((next_previous, next_current, next_width, next_height));
     }
 
-    let (coarse_previous, coarse_current, coarse_width, coarse_height) = &pyramid[2];
+    let (coarse_previous, coarse_current, coarse_width, coarse_height) = &pyramid[PYRAMID_LEVELS];
     let mut best = (f32::MAX, 0, 0);
     let mut total = 0.0_f32;
     let mut candidates = 0_u32;
@@ -4405,9 +4406,9 @@ fn estimate_frame_translation(
 
     let mut shift = (best.1, best.2);
     let mut final_score = best.0;
-    for level in [1_usize, 0] {
+    for level in (0..PYRAMID_LEVELS).rev() {
         let (level_previous, level_current, level_width, level_height) = &pyramid[level];
-        let step = if level == 0 { 2 } else { 1 };
+        let step = 1;
         let centre = (shift.0 * 2, shift.1 * 2);
         let mut level_best = (f32::MAX, centre.0, centre.1);
         for dy in -REFINE_RADIUS..=REFINE_RADIUS {
@@ -4445,7 +4446,7 @@ fn estimate_frame_translation(
             *base_width,
             *base_height,
             (shift.0 + dx, shift.1 + dy),
-            2,
+            1,
         )
     };
     let fractional_x = match (score_at(-1, 0), score_at(0, 0), score_at(1, 0)) {
@@ -5759,7 +5760,7 @@ mod tests {
     fn motion_analysis_reports_samples_for_the_selected_duration() {
         assert_eq!(expected_motion_analysis_samples(7.0, 30.0), 210);
         assert_eq!(expected_motion_analysis_samples(20.0, 24.0), 480);
-        assert_eq!(motion_analysis_fps(60.0), 30.0);
+        assert_eq!(motion_analysis_fps(240.0), 120.0);
         assert_eq!(motion_analysis_fps(24.0), 24.0);
     }
 
